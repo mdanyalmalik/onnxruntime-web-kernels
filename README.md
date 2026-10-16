@@ -24,6 +24,11 @@ Each `.wasm` only works with the `.mjs` built with it, so load them as a pair (f
   ([Ternary Bonsai 2](https://huggingface.co/prism-ml)) in Quick Inference with about 30% faster decoding and 55%
   faster prompts, with outputs closer to ONNX Runtime's CPU results.
 
+- **Squared ReLU in WebGPU QMoE** (v1.30.0-qi.2). `activation_type="relu2"` (`max(x, 0)^2`, the name ONNX Runtime's
+  CUDA MoE uses), plus `relu`, `silu` and `identity`, which ONNX Runtime 1.30's WebGPU QMoE rejected (it only ran
+  SwiGLU). Lets Nemotron-H models store each expert's up projection once instead of twice (as SwiGLU's gate and up
+  halves): Nemotron 3 Nano's experts shrink by a third.
+
 Everything else is ONNX Runtime 1.30.0 as released.
 
 ## Building

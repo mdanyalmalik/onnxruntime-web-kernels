@@ -1,3 +1,112 @@
+diff --git a/onnxruntime/contrib_ops/webgpu/moe/moe.h b/onnxruntime/contrib_ops/webgpu/moe/moe.h
+index 332aa39..f8e7d2e 100755
+--- a/onnxruntime/contrib_ops/webgpu/moe/moe.h
++++ b/onnxruntime/contrib_ops/webgpu/moe/moe.h
+@@ -46,6 +46,8 @@ class MoE : public WebGpuKernel {
+       activation_type_ = MoEActivationType::Silu;
+     } else if (activation_type == "identity") {
+       activation_type_ = MoEActivationType::Identity;
++    } else if (activation_type == "relu2") {
++      activation_type_ = MoEActivationType::Relu2;
+     } else if (activation_type == "swiglu") {
+       activation_type_ = MoEActivationType::SwiGLU;
+     } else {
+diff --git a/onnxruntime/contrib_ops/webgpu/moe/moe_base.h b/onnxruntime/contrib_ops/webgpu/moe/moe_base.h
+index bab99fe..c24009f 100755
+--- a/onnxruntime/contrib_ops/webgpu/moe/moe_base.h
++++ b/onnxruntime/contrib_ops/webgpu/moe/moe_base.h
+@@ -19,7 +19,8 @@ enum class MoEActivationType {
+   Silu,
+   Identity,
+   SwiGLU,
+-
++  // Quick Inference patch: max(x, 0)^2 (Nemotron-H's experts), named as in ONNX Runtime's CUDA MoE.
++  Relu2,
+ };
+ 
+ enum class MoEQuantType {
+diff --git a/onnxruntime/contrib_ops/webgpu/moe/qmoe.cc b/onnxruntime/contrib_ops/webgpu/moe/qmoe.cc
+index b2797db..f2d5409 100755
+--- a/onnxruntime/contrib_ops/webgpu/moe/qmoe.cc
++++ b/onnxruntime/contrib_ops/webgpu/moe/qmoe.cc
+@@ -124,6 +124,43 @@ class SwigLuProgram final : public Program<SwigLuProgram> {
+  private:
+ };
+ 
++// Quick Inference patch: the non-gated activations between fc1 and fc2, element by element.
++class MoEActivationProgram final : public Program<MoEActivationProgram> {
++ public:
++  explicit MoEActivationProgram(MoEActivationType type) : Program<MoEActivationProgram>{"MoEActivation"}, type_{type} {}
++
++  Status GenerateShaderCode(ShaderHelper& shader) const override {
++    shader.AddInput("input", ShaderUsage::UseElementTypeAlias);
++    shader.AddOutput("output", ShaderUsage::UseElementTypeAlias);
++    std::string value;
++    switch (type_) {
++      case MoEActivationType::Relu:
++        value = "max(x, 0.0)";
++        break;
++      case MoEActivationType::Relu2:
++        value = "max(x, 0.0) * max(x, 0.0)";
++        break;
++      case MoEActivationType::Silu:
++        value = "x / (1.0 + exp(-x))";
++        break;
++      case MoEActivationType::Identity:
++        value = "x";
++        break;
++      default:
++        return ORT_MAKE_STATUS(ONNXRUNTIME, NOT_IMPLEMENTED, "This MoE activation is not supported on WebGPU.");
++    }
++    shader.MainFunctionBody() << shader.GuardAgainstOutOfBoundsWorkgroupSizes("uniforms.size")
++                              << "  let x = f32(input[global_idx]);\n"
++                              << "  output[global_idx] = output_element_t(" << value << ");\n";
++    return Status::OK();
++  }
++
++  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES({"size", ProgramUniformVariableDataType::Uint32});
++
++ private:
++  MoEActivationType type_;
++};
++
+ class FusedFinalMix1TokenProgram final : public Program<FusedFinalMix1TokenProgram> {
+  public:
+   FusedFinalMix1TokenProgram() : Program<FusedFinalMix1TokenProgram>{"QmoeFusedFinalMix1Token"} {}
+@@ -285,7 +322,15 @@ Status QMoE::ComputeInternal(ComputeContext& context) const {
+                                 swiglu_limit_});
+       ORT_RETURN_IF_ERROR(context.RunProgram(swiglu));
+     } else {
+-      ORT_THROW("only swiglu is supported for WebGPU.");
++      const uint32_t size = k * static_cast<uint32_t>(moe_params.inter_size);
++      MoEActivationProgram activation{activation_type_};
++      activation.AddInputs({{&fc1_outputs, ProgramTensorMetadataDependency::Type}})
++          .AddOutput({&fc1_activated, ProgramTensorMetadataDependency::None})
++          .SetWorkgroupSize(128)
++          .SetDispatchGroupSize((size + 127) / 128)
++          .AddUniformVariables({size})
++          .CacheHint(static_cast<int>(activation_type_));
++      ORT_RETURN_IF_ERROR(context.RunProgram(activation));
+     }
+ 
+     // Step 4: Batched fc2 MatMulNBits with M=k, per-row expert selection
+@@ -422,7 +467,15 @@ Status QMoE::ComputeInternal(ComputeContext& context) const {
+                                   swiglu_limit_});
+         ORT_RETURN_IF_ERROR(context.RunProgram(swiglu));
+       } else {
+-        ORT_THROW("only swiglu is supported for WebGPU.");
++        const uint32_t size = static_cast<uint32_t>(used_by) * static_cast<uint32_t>(moe_params.inter_size);
++        MoEActivationProgram activation{activation_type_};
++        activation.AddInputs({{&fc1_outputs, ProgramTensorMetadataDependency::Type}})
++            .AddOutput({&fc1_activated, ProgramTensorMetadataDependency::None})
++            .SetWorkgroupSize(128)
++            .SetDispatchGroupSize((size + 127) / 128)
++            .AddUniformVariables({size})
++            .CacheHint(static_cast<int>(activation_type_));
++        ORT_RETURN_IF_ERROR(context.RunProgram(activation));
+       }
+ 
+       //
 diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
 index 45baa67..ac5be95 100644
 --- a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
