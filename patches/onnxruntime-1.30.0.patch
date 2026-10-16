@@ -1,0 +1,202 @@
+diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
+index 45baa67..ac5be95 100644
+--- a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
++++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
+@@ -8,6 +8,7 @@
+ #include "contrib_ops/webgpu/quantization/matmul_nbits_common.h"
+ #include "contrib_ops/webgpu/quantization/subgroup_matrix_matmul_nbits.h"
+ #include "contrib_ops/webgpu/quantization/dp4a_matmul_nbits.h"
++#include "contrib_ops/webgpu/quantization/matmul_nbits_q2_decode.h"
+ #include "contrib_ops/webgpu/webgpu_contrib_kernels.h"
+ #include "core/providers/cpu/math/matmul_helper.h"
+ #include "core/providers/webgpu/shader_helper.h"
+@@ -245,6 +246,12 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
+     return ApplyDP4AMatrixMatMulNBits(a, b, scales, zero_points, bias, batch_count, M, dispatch_M, N, K, block_size, zero_blocks_per_col, kMinMForTileOptimization, static_cast<uint32_t>(nbits), context, y, weight_index, weight_index_indirect);
+   }
+ 
++  // Quick Inference patch: 2-bit weights without zero points (see matmul_nbits_q2_decode.h).
++  if (!broadcast_a && CanApplyMatMulNBitsQ2Decode(static_cast<uint32_t>(nbits), has_zero_points, has_weight_idx, single_scale_weights,
++                                                  block_size, K, batch_count)) {
++    return ApplyMatMulNBitsQ2Decode(a, b, scales, bias, M, N, K, block_size, context, y);
++  }
++
+   // WideTileProgram
+   // This program is optimized for Block32 prefill.
+   const bool use_wide_tile_program = CanApplyWideTileMatMulNBits(M,
+diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_q2_decode.cc b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_q2_decode.cc
+new file mode 100644
+index 0000000..a094acc
+--- /dev/null
++++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_q2_decode.cc
+@@ -0,0 +1,120 @@
++// Copyright (c) Quick Inference contributors.
++// Licensed under the MIT License.
++// Quick Inference patch: see matmul_nbits_q2_decode.h.
++
++#include "contrib_ops/webgpu/quantization/matmul_nbits_q2_decode.h"
++
++#include "core/providers/webgpu/shader_helper.h"
++#include "core/providers/webgpu/webgpu_utils.h"
++
++namespace onnxruntime {
++namespace contrib {
++namespace webgpu {
++
++namespace {
++constexpr uint32_t kQ2DecodeTeams = 4;
++constexpr uint32_t kQ2DecodeRowsPerTeam = 2;
++constexpr uint32_t kQ2DecodeRows = kQ2DecodeTeams * kQ2DecodeRowsPerTeam;
++}  // namespace
++
++Status MatMulNBitsQ2DecodeProgram::GenerateShaderCode(ShaderHelper& shader) const {
++  shader.AddInput("input_a", ShaderUsage::UseValueTypeAlias);
++  shader.AddInput("input_b");
++  shader.AddInput("scales_b");
++  if (has_bias_) {
++    shader.AddInput("bias");
++  }
++  shader.AddOutput("output", ShaderUsage::UseElementTypeAlias);
++
++  shader.AdditionalImplementation()
++      << "const ROWS_PER_TEAM: u32 = " << kQ2DecodeRowsPerTeam << "u;\n"
++      << "const ROWS: u32 = " << kQ2DecodeRows << "u;\n"
++      << "fn q4(word: u32, byte: u32) -> vec4<f32> {\n"
++      << "  let codes = (vec4<u32>(word >> (8u * byte)) >> vec4<u32>(0u, 2u, 4u, 6u)) & vec4<u32>(3u);\n"
++      << "  return bitcast<vec4<f32>>(codes | vec4<u32>(0x4b000000u)) - vec4<f32>(8388610.0);\n"
++      << "}\n";
++  if (!use_subgroups_) {
++    shader.AdditionalImplementation() << "var<workgroup> partial: array<f32, " << kQ2DecodeRows * 32 << ">;\n";
++  }
++
++  auto& body = shader.MainFunctionBody();
++  body << "  let team = local_idx / 32u;\n"
++       << "  let lane = local_idx % 32u;\n"
++       << "  let group = workgroup_idx % uniforms.row_groups;\n"
++       << "  let m = workgroup_idx / uniforms.row_groups;\n"
++       << "  let first = group * ROWS + team * ROWS_PER_TEAM;\n"
++       << "  var acc: array<f32, ROWS_PER_TEAM>;\n"
++       << "  for (var s = lane; s < uniforms.steps; s += 32u) {\n"
++       << "    var xv: array<vec4<f32>, 8>;\n"
++       << "    let xb = (m * uniforms.steps + s) * 8u;\n"
++       << "    for (var j = 0u; j < 8u; j++) { xv[j] = vec4<f32>(input_a[xb + j]); }\n"
++       << "    for (var t = 0u; t < ROWS_PER_TEAM; t++) {\n"
++       << "      let row = min(first + t, uniforms.N - 1u);\n"
++       << "      let words = input_b[row * uniforms.steps + s];\n"
++       << "      var q = 0.0;\n"
++       << "      for (var byte = 0u; byte < 4u; byte++) {\n"
++       << "        q += dot(xv[byte], q4(words.x, byte)) + dot(xv[4u + byte], q4(words.y, byte));\n"
++       << "      }\n"
++       << "      acc[t] += f32(scales_b[row * uniforms.blocks_per_col + s / uniforms.steps_per_block]) * q;\n"
++       << "    }\n"
++       << "  }\n";
++  const std::string bias = has_bias_ ? " + f32(bias[row])" : "";
++  if (use_subgroups_) {
++    // Subgroups of exactly 32 lanes (checked on the host): a team is a subgroup.
++    body << "  for (var t = 0u; t < ROWS_PER_TEAM; t++) {\n"
++         << "    let total = subgroupAdd(acc[t]);\n"
++         << "    let row = first + t;\n"
++         << "    if (lane == 0u && row < uniforms.N) { output[m * uniforms.N + row] = output_element_t(total" << bias << "); }\n"
++         << "  }\n";
++  } else {
++    body << "  for (var t = 0u; t < ROWS_PER_TEAM; t++) { partial[(team * ROWS_PER_TEAM + t) * 32u + lane] = acc[t]; }\n"
++         << "  workgroupBarrier();\n"
++         << "  for (var stride = 16u; stride > 0u; stride = stride / 2u) {\n"
++         << "    if (lane < stride) {\n"
++         << "      for (var t = 0u; t < ROWS_PER_TEAM; t++) {\n"
++         << "        let i = (team * ROWS_PER_TEAM + t) * 32u + lane;\n"
++         << "        partial[i] += partial[i + stride];\n"
++         << "      }\n"
++         << "    }\n"
++         << "    workgroupBarrier();\n"
++         << "  }\n"
++         << "  for (var t = 0u; t < ROWS_PER_TEAM; t++) {\n"
++         << "    let row = first + t;\n"
++         << "    if (lane == 0u && row < uniforms.N) {\n"
++         << "      output[m * uniforms.N + row] = output_element_t(partial[(team * ROWS_PER_TEAM + t) * 32u]" << bias << ");\n"
++         << "    }\n"
++         << "  }\n";
++  }
++  return Status::OK();
++}
++
++bool CanApplyMatMulNBitsQ2Decode(uint32_t nbits, bool has_zero_points, bool has_weight_idx, bool single_scale_weights,
++                                 uint32_t block_size, uint32_t K, uint32_t batch_count) {
++  return nbits == 2 && !has_zero_points && !has_weight_idx && !single_scale_weights && block_size % 32 == 0 &&
++         K % 32 == 0 && batch_count == 1;
++}
++
++Status ApplyMatMulNBitsQ2Decode(const Tensor* a, const Tensor* b, const Tensor* scales, const Tensor* bias,
++                                uint32_t M, uint32_t N, uint32_t K, uint32_t block_size,
++                                onnxruntime::webgpu::ComputeContext& context, Tensor* y) {
++  const bool use_subgroups = context.HasFeature(wgpu::FeatureName::Subgroups) &&
++                             context.AdapterInfo().subgroupMinSize == 32 && context.AdapterInfo().subgroupMaxSize == 32;
++  const uint32_t row_groups = CeilDiv(N, kQ2DecodeRows);
++  MatMulNBitsQ2DecodeProgram program{bias != nullptr, use_subgroups};
++  program.SetWorkgroupSize(kQ2DecodeTeams * 32);
++  program.SetDispatchGroupSize(row_groups * M);
++  program.AddInputs({{a, ProgramTensorMetadataDependency::TypeAndRank, 4},
++                     {b, ProgramTensorMetadataDependency::TypeAndRank, 8},
++                     {scales, ProgramTensorMetadataDependency::TypeAndRank}});
++  if (bias != nullptr) {
++    program.AddInput({bias, ProgramTensorMetadataDependency::None});
++  }
++  program.AddOutput({y, ProgramTensorMetadataDependency::TypeAndRank});
++  program.AddUniformVariables({{N}, {K / 32}, {CeilDiv(K, block_size)}, {block_size / 32}, {row_groups}});
++  program.CacheHint(bias != nullptr, use_subgroups);
++  return context.RunProgram(program);
++}
++
++}  // namespace webgpu
++}  // namespace contrib
++}  // namespace onnxruntime
+diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_q2_decode.h b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_q2_decode.h
+new file mode 100644
+index 0000000..4632d51
+--- /dev/null
++++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_q2_decode.h
+@@ -0,0 +1,45 @@
++// Copyright (c) Quick Inference contributors.
++// Licensed under the MIT License.
++// Quick Inference patch: a faster 2-bit MatMulNBits kernel for few rows of A (decoding).
++
++#pragma once
++
++#include "core/providers/webgpu/program.h"
++#include "core/providers/webgpu/compute_context.h"
++
++namespace onnxruntime {
++namespace contrib {
++namespace webgpu {
++
++using namespace onnxruntime::webgpu;
++
++// Each team of 32 lanes computes kQ2DecodeRowsPerTeam output rows; a lane takes 32 weights (two words) of each row
++// per step, keeping its 32 values of A in registers for all of them. Weights are decoded four at a time: byte b of a
++// word holds weights 4b..4b+3, (vec4(byte) >> (0, 2, 4, 6)) & 3 puts them in a vec4<u32>, and OR-ing 0x4b000000 makes
++// floats 2^23 + q, so one subtraction gives q - zero (2) exactly.
++class MatMulNBitsQ2DecodeProgram final : public Program<MatMulNBitsQ2DecodeProgram> {
++ public:
++  MatMulNBitsQ2DecodeProgram(bool has_bias, bool use_subgroups)
++      : Program{"MatMulNBitsQ2Decode"}, has_bias_{has_bias}, use_subgroups_{use_subgroups} {}
++  Status GenerateShaderCode(ShaderHelper& sh) const override;
++  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES({"N", ProgramUniformVariableDataType::Uint32},
++                                          {"steps", ProgramUniformVariableDataType::Uint32},
++                                          {"blocks_per_col", ProgramUniformVariableDataType::Uint32},
++                                          {"steps_per_block", ProgramUniformVariableDataType::Uint32},
++                                          {"row_groups", ProgramUniformVariableDataType::Uint32});
++
++ private:
++  bool has_bias_;
++  bool use_subgroups_;
++};
++
++bool CanApplyMatMulNBitsQ2Decode(uint32_t nbits, bool has_zero_points, bool has_weight_idx, bool single_scale_weights,
++                                 uint32_t block_size, uint32_t K, uint32_t batch_count);
++
++Status ApplyMatMulNBitsQ2Decode(const Tensor* a, const Tensor* b, const Tensor* scales, const Tensor* bias,
++                                uint32_t M, uint32_t N, uint32_t K, uint32_t block_size,
++                                onnxruntime::webgpu::ComputeContext& context, Tensor* y);
++
++}  // namespace webgpu
++}  // namespace contrib
++}  // namespace onnxruntime
