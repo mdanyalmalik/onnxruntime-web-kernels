@@ -108,7 +108,7 @@ index b2797db..f2d5409 100755
  
        //
 diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
-index 45baa67..ac5be95 100644
+index 45baa67..57773bd 100644
 --- a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
 +++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
 @@ -8,6 +8,7 @@
@@ -119,7 +119,7 @@ index 45baa67..ac5be95 100644
  #include "contrib_ops/webgpu/webgpu_contrib_kernels.h"
  #include "core/providers/cpu/math/matmul_helper.h"
  #include "core/providers/webgpu/shader_helper.h"
-@@ -245,6 +246,12 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
+@@ -245,8 +246,14 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
      return ApplyDP4AMatrixMatMulNBits(a, b, scales, zero_points, bias, batch_count, M, dispatch_M, N, K, block_size, zero_blocks_per_col, kMinMForTileOptimization, static_cast<uint32_t>(nbits), context, y, weight_index, weight_index_indirect);
    }
  
@@ -130,8 +130,51 @@ index 45baa67..ac5be95 100644
 +  }
 +
    // WideTileProgram
-   // This program is optimized for Block32 prefill.
+-  // This program is optimized for Block32 prefill.
++  // This program is optimized for prefill with blocks of 32 (or of a multiple of 32, walked 32 at a time).
    const bool use_wide_tile_program = CanApplyWideTileMatMulNBits(M,
+                                                                  K,
+                                                                  block_size,
+@@ -316,7 +323,9 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
+                                  {zero_blocks_per_col},
+                                  {num_N_tile},
+                                  {num_M_tile},
+-                                 {weight_index}});
++                                 {weight_index},
++                                 {block_size / 32},
++                                 {n_blocks_per_col * (block_size / 32)}});
+     program.CacheHint(nbits, has_zero_points, has_bias, has_weight_idx, has_weight_idx_indirect, subgroup_min_size);
+ 
+     return context.RunProgram(program);
+diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.h b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.h
+index bf56d4f..605949d 100644
+--- a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.h
++++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.h
+@@ -27,7 +27,9 @@ class MatMulNBitsWideTileProgram final : public Program<MatMulNBitsWideTileProgr
+                                           {"zero_blocks_per_col", ProgramUniformVariableDataType::Uint32},
+                                           {"num_N_tile", ProgramUniformVariableDataType::Uint32},
+                                           {"num_M_tile", ProgramUniformVariableDataType::Uint32},
+-                                          {"weight_idx", ProgramUniformVariableDataType::Uint32});
++                                          {"weight_idx", ProgramUniformVariableDataType::Uint32},
++                                          {"k32_per_block", ProgramUniformVariableDataType::Uint32},
++                                          {"n_k32", ProgramUniformVariableDataType::Uint32});
+ 
+  private:
+   bool has_zero_points_;
+diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_common.cc b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_common.cc
+index 34d9ff4..710266e 100644
+--- a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_common.cc
++++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_common.cc
+@@ -86,7 +86,8 @@ bool CanApplyWideTileMatMulNBits(uint32_t M,
+     components_b = onnxruntime::webgpu::GetMaxComponents(blob_size_in_words);
+   }
+ 
+-  return block_size == 32 &&
++  // Blocks of 32, or of a multiple of 32 (GPTQ's 128): a block's bytes are its 32-weight runs one after another.
++  return block_size % 32 == 0 &&
+          components_a == 4 &&
+          components_b == 4 &&
+          nbits != 2 &&
 diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_q2_decode.cc b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_q2_decode.cc
 new file mode 100644
 index 0000000..a094acc
@@ -309,3 +352,46 @@ index 0000000..4632d51
 +}  // namespace webgpu
 +}  // namespace contrib
 +}  // namespace onnxruntime
+diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_wide_tile.wgsl.template b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_wide_tile.wgsl.template
+index 15e78e8..f8f6e87 100644
+--- a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_wide_tile.wgsl.template
++++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_wide_tile.wgsl.template
+@@ -12,8 +12,9 @@
+ 
+ #use .getByOffset .setByOffset
+ 
+-// Only support Block32 at the moment.
+-// A block of 32 elements maps to 8 vec4 (input_a_value_t) vectors along K.
++// Walks K 32 elements at a time: blocks of 32, or of a multiple of 32 (uniforms.k32_per_block runs of 32 sharing a
++// block's scale and zero point; a block's bytes are its runs one after another). 32 elements are 8 vec4
++// (input_a_value_t) vectors along K.
+ const KAVecSizeForBlock32 = 8u;
+ 
+ const kTileM : u32 = tile_m;
+@@ -203,7 +204,8 @@ $MAIN {
+ #endif
+ 
+   var results : array<output_element_t, kTileM>;
+-  for (var block_idx = 0u; block_idx < uniforms.n_blocks_per_col; block_idx++) {
++  for (var k32 = 0u; k32 < uniforms.n_k32; k32++) {
++    let block_idx = k32 / uniforms.k32_per_block;
+     // Load `a` elements into workgroup memory, kTileM x KAVecSizeForBlock32 (block32),
+     // stored as pairs of vecs along K. One pass covers workgroup_size_x / KAVecSizeForBlock32
+     // rows, so loop when kTileM is wider than that.
+@@ -212,14 +214,14 @@ $MAIN {
+       let a_col_idx = local_idx % KAVecSizeForBlock32;
+       a_data_tile[a_col_idx / 2u][a_row_idx][a_col_idx % 2u] = load_a(batch,
+                                                                       row + a_row_idx,
+-                                                                      block_idx * KAVecSizeForBlock32 + a_col_idx);
++                                                                      k32 * KAVecSizeForBlock32 + a_col_idx);
+     }
+     workgroupBarrier();
+ 
+     let b_row = col + local_idx;
+     let scale = load_scale(b_row, block_idx);
+     let zero_point = load_zero(b_row, block_idx, uniforms.N, uniforms.zero_blocks_per_col);
+-    let b_data = load_b(b_row, block_idx);
++    let b_data = load_b(b_row, k32);
+ 
+     for (var b_idx = 0u; b_idx < KAVecSizeForBlock32 / 2u; b_idx++) {
+       let b_dequantized = dequantize(b_data[b_idx], zero_point, scale);

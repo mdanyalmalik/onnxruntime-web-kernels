@@ -29,6 +29,14 @@ Each `.wasm` only works with the `.mjs` built with it, so load them as a pair (f
   SwiGLU). Lets Nemotron-H models store each expert's up projection once instead of twice (as SwiGLU's gate and up
   halves): Nemotron 3 Nano's experts shrink by a third.
 
+- **Fast prompts with blocks of 128** (v1.30.0-qi.3). ONNX Runtime's fast MatMulNBits program for prompts (the "wide
+  tile" one) only took blocks of 32 weights; other block sizes fell back to its general kernel. GPTQ and AWQ
+  checkpoints usually use blocks of 128, whose bytes are already four 32-weight runs one after another, so the program
+  now walks K 32 weights at a time and reads the scale (and zero point) of block `k32 / (block_size / 32)`: any
+  multiple of 32 works, with or without zero points, 4 or 8 bits. Results match ONNX Runtime's CPU kernel as closely as
+  blocks of 32 do. Muse Glimmer 30B (Red Hat's GPTQ weights, blocks of 128) read prompts 6× faster in Quick Inference
+  (5.5 → 33 tokens/s).
+
 Everything else is ONNX Runtime 1.30.0 as released.
 
 ## Building
