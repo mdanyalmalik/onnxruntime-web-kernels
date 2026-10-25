@@ -1,3 +1,672 @@
+diff --git a/onnxruntime/contrib_ops/webgpu/bert/causal_conv_with_state.cc b/onnxruntime/contrib_ops/webgpu/bert/causal_conv_with_state.cc
+index a47b313..f178d1b 100644
+--- a/onnxruntime/contrib_ops/webgpu/bert/causal_conv_with_state.cc
++++ b/onnxruntime/contrib_ops/webgpu/bert/causal_conv_with_state.cc
+@@ -44,8 +44,10 @@ CausalConvWithState::CausalConvWithState(const OpKernelInfo& info)
+   ORT_THROW_IF_ERROR(causal_conv_with_state_helper::ParseDilation(info, dilation_));
+   ORT_THROW_IF_ERROR(causal_conv_with_state_helper::ParseChannelsLast(info, channels_last_));
+   ORT_ENFORCE(!channels_last_ || ndim_ == 1, "channels_last requires ndim = 1");
+-  ORT_ENFORCE(info.GetAttrOrDefault<int64_t>("state_window", 0) == 0,
+-              "WebGPU CausalConvWithState does not support state_window > 0 (CUDA EP only)");
++  // Quick Inference patch: state_window (speculative decoding rolls the state back to an accepted prefix).
++  const int64_t state_window = info.GetAttrOrDefault<int64_t>("state_window", 0);
++  ORT_ENFORCE(state_window >= 0 && state_window <= 8, "CausalConvWithState: state_window must be in [0, 8]");
++  state_window_ = static_cast<int>(state_window);
+ }
+ 
+ Status CausalConvWithStateProgram::GenerateShaderCode(ShaderHelper& shader) const {
+@@ -120,6 +122,54 @@ Status CausalConvUpdateStateProgram::GenerateShaderCode(ShaderHelper& shader) co
+   return Status::OK();
+ }
+ 
++Status CausalConvWindowStateProgram::GenerateShaderCode(ShaderHelper& shader) const {
++  shader.AddInput("input", ShaderUsage::UseElementTypeAlias);
++  if (past_input_) {
++    shader.AddInput("conv_state", ShaderUsage::UseUniform);
++  }
++  shader.AddOutput("present_state", ShaderUsage::UseUniform);
++  auto& body = shader.MainFunctionBody();
++  body << shader.GuardAgainstOutOfBoundsWorkgroupSizes("uniforms.update_size");
++  if (channels_last_) {
++    body << "  let batch_idx = global_idx / uniforms.channels;\n"
++            "  let channel_idx = global_idx % uniforms.channels;\n"
++            "  let base_state = batch_idx * uniforms.channels * uniforms.state_length + channel_idx;\n"
++            "  let state_stride = uniforms.channels;\n"
++            "  let base_input = batch_idx * uniforms.channels * uniforms.input_length + channel_idx;\n"
++            "  let input_stride = uniforms.channels;\n";
++  } else {
++    body << "  let base_state = global_idx * uniforms.state_length;\n"
++            "  let state_stride = 1u;\n"
++            "  let base_input = global_idx * uniforms.input_length;\n"
++            "  let input_stride = 1u;\n";
++  }
++  const std::string past = past_input_ ? "conv_state" : "present_state";
++  body << "  let past_base = base_state + (uniforms.state_window - 1u) * uniforms.slot_stride;\n"
++          "  var prev: array<input_element_t, 16>;\n"
++          "  if (uniforms.has_past != 0u) {\n"
++          "    for (var s = 0u; s < uniforms.state_length; s++) { prev[s] = input_element_t("
++       << past << "[past_base + s * state_stride]); }\n"
++          "  }\n"
++          "  let L = uniforms.input_length;\n"
++          "  let W = uniforms.state_window;\n"
++          "  let S = uniforms.state_length;\n"
++          "  for (var t = select(0u, L - W, L > W); t < L; t++) {\n"
++          "    let slot_base = base_state + (t + W - L) * uniforms.slot_stride;\n"
++          "    for (var s = 0u; s < S; s++) {\n"
++          "      let vp = t + 1u + s;\n"
++          "      var value = input_element_t(0.0);\n"
++          "      if (vp < S) { value = prev[vp]; } else { value = input[base_input + (vp - S) * input_stride]; }\n"
++          "      present_state[slot_base + s * state_stride] = value;\n"
++          "    }\n"
++          "  }\n"
++          "  if (uniforms.zero_leading_slots != 0u) {\n"
++          "    for (var slot = 0u; slot + L < W; slot++) {\n"
++          "      for (var s = 0u; s < S; s++) { present_state[base_state + slot * uniforms.slot_stride + s * state_stride] = input_element_t(0.0); }\n"
++          "    }\n"
++          "  }\n";
++  return Status::OK();
++}
++
+ Status CausalConvWithState::ComputeInternal(ComputeContext& context) const {
+   const Tensor* input = context.Input(0);       // (B, D, L)
+   const Tensor* weight = context.Input(1);      // (D, 1, K)
+@@ -165,6 +215,10 @@ Status CausalConvWithState::ComputeInternal(ComputeContext& context) const {
+   } else {
+     state_dims = TensorShapeVector{batch_size, channels, state_length};
+   }
++  if (state_window_ > 0) {
++    ORT_RETURN_IF(state_length > 16, "state_window needs state_length <= 16");
++    state_dims.insert(state_dims.begin(), state_window_);
++  }
+   const TensorShape state_shape(state_dims);
+ 
+   if (conv_state != nullptr) {
+@@ -196,12 +250,14 @@ Status CausalConvWithState::ComputeInternal(ComputeContext& context) const {
+   }
+ 
+   // Create and run the shader program
+-  CausalConvWithStateProgram program{activation_, has_bias, has_conv_state, !conv_state_in_present_state,
++  // With a window, CausalConvWindowStateProgram writes present_state.
++  const bool window = state_window_ > 0;
++  CausalConvWithStateProgram program{activation_, has_bias, has_conv_state, !conv_state_in_present_state && !window,
+                                      channels_last_};
+ 
+   uint32_t output_size = static_cast<uint32_t>(batch_size * channels * input_length);
+ 
+-  program.CacheHint(has_bias, has_conv_state, !conv_state_in_present_state,
++  program.CacheHint(has_bias, has_conv_state, !conv_state_in_present_state && !window,
+                     kernel_size, dilation_, static_cast<int>(activation_), channels_last_);
+ 
+   program.AddInput({input, ProgramTensorMetadataDependency::Type})
+@@ -215,9 +271,10 @@ Status CausalConvWithState::ComputeInternal(ComputeContext& context) const {
+   }
+ 
+   program.AddOutput({output, ProgramTensorMetadataDependency::None});
+-  if (!conv_state_in_present_state) {
++  if (!conv_state_in_present_state && !window) {
+     program.AddOutput({present_state, ProgramTensorMetadataDependency::None});
+   }
++  const uint32_t slot_stride = static_cast<uint32_t>(batch_size * channels * state_length);
+ 
+   program.SetDispatchGroupSize((output_size + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE)
+       .AddUniformVariable({static_cast<uint32_t>(batch_size)})
+@@ -226,10 +283,33 @@ Status CausalConvWithState::ComputeInternal(ComputeContext& context) const {
+       .AddUniformVariable({static_cast<uint32_t>(kernel_size)})
+       .AddUniformVariable({static_cast<uint32_t>(dilation_)})
+       .AddUniformVariable({static_cast<uint32_t>(state_length)})
+-      .AddUniformVariable({output_size});
++      .AddUniformVariable({output_size})
++      .AddUniformVariable({window ? static_cast<uint32_t>(state_window_ - 1) * slot_stride : 0u});
+ 
+   ORT_RETURN_IF_ERROR(context.RunProgram(program));
+ 
++  if (window) {
++    const bool past_input = has_conv_state && !conv_state_in_present_state;
++    CausalConvWindowStateProgram window_program{channels_last_, past_input};
++    const uint32_t update_size = static_cast<uint32_t>(batch_size * channels);
++    window_program.CacheHint(channels_last_, past_input);
++    window_program.AddInput({input, ProgramTensorMetadataDependency::Type});
++    if (past_input) {
++      window_program.AddInput({conv_state, ProgramTensorMetadataDependency::None});
++    }
++    window_program.AddOutput({present_state, ProgramTensorMetadataDependency::None})
++        .SetDispatchGroupSize((update_size + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE)
++        .AddUniformVariables({{static_cast<uint32_t>(channels)},
++                              {static_cast<uint32_t>(input_length)},
++                              {static_cast<uint32_t>(state_length)},
++                              {update_size},
++                              {static_cast<uint32_t>(state_window_)},
++                              {slot_stride},
++                              {has_conv_state ? 1u : 0u},
++                              {conv_state_in_present_state ? 0u : 1u}});
++    return context.RunProgram(window_program);
++  }
++
+   if (conv_state_in_present_state) {
+     CausalConvUpdateStateProgram update_state_program{channels_last_};
+     const uint32_t update_size = static_cast<uint32_t>(batch_size * channels);
+diff --git a/onnxruntime/contrib_ops/webgpu/bert/causal_conv_with_state.h b/onnxruntime/contrib_ops/webgpu/bert/causal_conv_with_state.h
+index d724261..586ddb2 100644
+--- a/onnxruntime/contrib_ops/webgpu/bert/causal_conv_with_state.h
++++ b/onnxruntime/contrib_ops/webgpu/bert/causal_conv_with_state.h
+@@ -45,7 +45,8 @@ class CausalConvWithStateProgram final : public Program<CausalConvWithStateProgr
+       {"kernel_size", ProgramUniformVariableDataType::Uint32},
+       {"dilation", ProgramUniformVariableDataType::Uint32},
+       {"state_length", ProgramUniformVariableDataType::Uint32},
+-      {"output_size", ProgramUniformVariableDataType::Uint32});
++      {"output_size", ProgramUniformVariableDataType::Uint32},
++      {"past_offset", ProgramUniformVariableDataType::Uint32});
+ 
+  private:
+   CausalConvActivation activation_;
+@@ -72,6 +73,31 @@ class CausalConvUpdateStateProgram final : public Program<CausalConvUpdateStateP
+   bool channels_last_;
+ };
+ 
++// Quick Inference patch: present_state for state_window = W > 0 (see the op schema): token t's state (the last
++// state_length positions of [past state, input] after it) goes to slot t + W - L, for the last W tokens; the past
++// state is slot W - 1. One thread per (batch, channel) reads its past values first, so updating in place is safe.
++class CausalConvWindowStateProgram final : public Program<CausalConvWindowStateProgram> {
++ public:
++  CausalConvWindowStateProgram(bool channels_last, bool past_input)
++      : Program{"CausalConvWindowState"}, channels_last_(channels_last), past_input_(past_input) {}
++
++  Status GenerateShaderCode(ShaderHelper& sh) const override;
++
++  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
++      {"channels", ProgramUniformVariableDataType::Uint32},
++      {"input_length", ProgramUniformVariableDataType::Uint32},
++      {"state_length", ProgramUniformVariableDataType::Uint32},
++      {"update_size", ProgramUniformVariableDataType::Uint32},
++      {"state_window", ProgramUniformVariableDataType::Uint32},
++      {"slot_stride", ProgramUniformVariableDataType::Uint32},
++      {"has_past", ProgramUniformVariableDataType::Uint32},
++      {"zero_leading_slots", ProgramUniformVariableDataType::Uint32});
++
++ private:
++  bool channels_last_;
++  bool past_input_;  // the past state is an input of its own (else it's present_state, updated in place)
++};
++
+ // Kernel for CausalConvWithState
+ class CausalConvWithState final : public WebGpuKernel {
+  public:
+@@ -83,6 +109,7 @@ class CausalConvWithState final : public WebGpuKernel {
+   int64_t ndim_;
+   int dilation_;
+   bool channels_last_;
++  int state_window_;  // Quick Inference patch: per-token states kept, 0 = the last state only
+ };
+ 
+ }  // namespace webgpu
+diff --git a/onnxruntime/contrib_ops/webgpu/bert/causal_conv_with_state.wgsl.template b/onnxruntime/contrib_ops/webgpu/bert/causal_conv_with_state.wgsl.template
+index 1f95a2f..e4b1761 100644
+--- a/onnxruntime/contrib_ops/webgpu/bert/causal_conv_with_state.wgsl.template
++++ b/onnxruntime/contrib_ops/webgpu/bert/causal_conv_with_state.wgsl.template
+@@ -81,7 +81,7 @@ $MAIN {
+ #if has_conv_state
+     if (virtual_pos < state_length) {
+       // Read from conv_state
+-      val = conv_state[state_base + virtual_pos * state_pos_stride];
++      val = conv_state[uniforms.past_offset + state_base + virtual_pos * state_pos_stride];
+     } else {
+       // Read from input
+       let input_pos = virtual_pos - state_length;
+@@ -123,7 +123,7 @@ $MAIN {
+ 
+ #if has_conv_state
+       if (vp < state_length) {
+-        state_val = conv_state[state_base + vp * state_pos_stride];
++        state_val = conv_state[uniforms.past_offset + state_base + vp * state_pos_stride];
+       } else {
+         let ip = vp - state_length;
+         state_val = input[input_base + ip * input_pos_stride];
+diff --git a/onnxruntime/contrib_ops/webgpu/bert/linear_attention.cc b/onnxruntime/contrib_ops/webgpu/bert/linear_attention.cc
+index 570effd..43fbc15 100644
+--- a/onnxruntime/contrib_ops/webgpu/bert/linear_attention.cc
++++ b/onnxruntime/contrib_ops/webgpu/bert/linear_attention.cc
+@@ -110,8 +110,10 @@ LinearAttention::LinearAttention(const OpKernelInfo& info)
+   scale_ = info.GetAttrOrDefault<float>("scale", 0.0f);
+   q_num_heads_ = static_cast<int>(info.GetAttr<int64_t>("q_num_heads"));
+   kv_num_heads_ = static_cast<int>(info.GetAttr<int64_t>("kv_num_heads"));
+-  ORT_ENFORCE(info.GetAttrOrDefault<int64_t>("state_window", 0) == 0,
+-              "WebGPU LinearAttention does not support state_window > 0 (CUDA EP only)");
++  // Quick Inference patch: state_window (speculative decoding rolls the state back to an accepted prefix).
++  const int64_t state_window = info.GetAttrOrDefault<int64_t>("state_window", 0);
++  ORT_ENFORCE(state_window >= 0 && state_window <= 8, "LinearAttention: state_window must be in [0, 8]");
++  state_window_ = static_cast<int>(state_window);
+ }
+ 
+ /*
+@@ -205,6 +207,12 @@ Status LinearAttention::ComputeInternal(ComputeContext& context) const {
+   Tensor* output = context.Output(0, output_shape);
+ 
+   TensorShapeVector state_shape({batch_size, kv_num_heads_, head_dim_k, head_dim_v});
++  if (state_window_ > 0) {
++    state_shape.insert(state_shape.begin(), state_window_);
++  }
++  if (past_state != nullptr) {
++    ORT_RETURN_IF(past_state->Shape() != TensorShape(state_shape), "past_state shape must be ", TensorShape(state_shape));
++  }
+   Tensor* present_state = context.Output(1, state_shape);
+ 
+   constexpr uint32_t kMaxSupportedWorkgroupSize = 256;
+@@ -298,7 +306,10 @@ Status LinearAttention::ComputeInternal(ComputeContext& context) const {
+                             {static_cast<uint32_t>(heads_per_group)},
+                             {static_cast<uint32_t>(kv_per_k_head)},
+                             {static_cast<uint32_t>(q_num_heads_)},
+-                            {static_cast<uint32_t>(n_k_heads)}});
++                            {static_cast<uint32_t>(n_k_heads)},
++                            {static_cast<uint32_t>(state_window_)},
++                            {static_cast<uint32_t>(batch_size * kv_num_heads_ * head_dim_k * head_dim_v_vectorized)},
++                            {static_cast<uint32_t>(state_window_ > 0 && !initial_state_in_present_state ? 1 : 0)}});
+ 
+   return context.RunProgram(program);
+ }
+diff --git a/onnxruntime/contrib_ops/webgpu/bert/linear_attention.h b/onnxruntime/contrib_ops/webgpu/bert/linear_attention.h
+index 81346fd..9001128 100644
+--- a/onnxruntime/contrib_ops/webgpu/bert/linear_attention.h
++++ b/onnxruntime/contrib_ops/webgpu/bert/linear_attention.h
+@@ -59,7 +59,10 @@ class LinearAttentionProgram final : public Program<LinearAttentionProgram> {
+       {"heads_per_group", ProgramUniformVariableDataType::Uint32},
+       {"kv_per_k_head", ProgramUniformVariableDataType::Uint32},
+       {"q_num_heads", ProgramUniformVariableDataType::Uint32},
+-      {"n_k_heads", ProgramUniformVariableDataType::Uint32});
++      {"n_k_heads", ProgramUniformVariableDataType::Uint32},
++      {"state_window", ProgramUniformVariableDataType::Uint32},
++      {"slot_stride", ProgramUniformVariableDataType::Uint32},
++      {"zero_leading_slots", ProgramUniformVariableDataType::Uint32});
+ 
+  private:
+   LinearAttentionUpdateRule update_rule_;
+@@ -84,6 +87,8 @@ class LinearAttention : public WebGpuKernel {
+   float scale_;
+   int q_num_heads_;
+   int kv_num_heads_;
++  // Quick Inference patch: per-token states kept (see the op schema's state_window), 0 = the last state only.
++  int state_window_;
+ };
+ 
+ }  // namespace webgpu
+diff --git a/onnxruntime/contrib_ops/webgpu/bert/linear_attention.wgsl.template b/onnxruntime/contrib_ops/webgpu/bert/linear_attention.wgsl.template
+index 1ac2214..f28b440 100644
+--- a/onnxruntime/contrib_ops/webgpu/bert/linear_attention.wgsl.template
++++ b/onnxruntime/contrib_ops/webgpu/bert/linear_attention.wgsl.template
+@@ -94,10 +94,15 @@ $MAIN {
+   // Initialize state tile in private memory
+   var state: array<vtype, TILE_V>;
+ 
++  // Quick Inference patch: state_window = W > 0 (see the op schema): the states are W slots of slot_stride values,
++  // slot W - 1 is read, and token t's state goes to slot t + W - T (only the last W tokens).
++  let state_row = ((batch_idx * uniforms.num_heads + head_idx) * uniforms.head_dim_k + dk_idx) * uniforms.head_dim_v + dv_start;
++  let last_slot = max(uniforms.state_window, 1u) - 1u;
++
+   // Load initial state if provided
+ #if has_initial_state
+   if (dk_idx < uniforms.head_dim_k) {
+-    let state_base = ((batch_idx * uniforms.num_heads + head_idx) * uniforms.head_dim_k + dk_idx) * uniforms.head_dim_v + dv_start;
++    let state_base = state_row + last_slot * uniforms.slot_stride;
+     for (var j = 0u; j < TILE_V; j++) {
+       if (dv_start + j < uniforms.head_dim_v) {
+ #if initial_state_in_present_state
+@@ -407,14 +412,34 @@ $MAIN {
+       workgroupBarrier();
+     }
+ #endif
++
++    // A window's slot for this token.
++    if (uniforms.state_window > 0u && t + uniforms.state_window >= uniforms.seq_length && dk_idx < uniforms.head_dim_k) {
++      let state_base = state_row + (t + uniforms.state_window - uniforms.seq_length) * uniforms.slot_stride;
++      for (var j = 0u; j < TILE_V; j++) {
++        if (dv_start + j < uniforms.head_dim_v) {
++          present_state[state_base + j] = otype(state[j]);
++        }
++      }
++    }
+   } // end token loop
+ 
+-  // Write present_state
++  // Write present_state (with a window: zero the slots before this call's first token, unless the states are the
++  // past ones, updated in place, where they are left alone)
+   if (dk_idx < uniforms.head_dim_k) {
+-    let state_base = ((batch_idx * uniforms.num_heads + head_idx) * uniforms.head_dim_k + dk_idx) * uniforms.head_dim_v + dv_start;
+-    for (var j = 0u; j < TILE_V; j++) {
+-      if (dv_start + j < uniforms.head_dim_v) {
+-        present_state[state_base + j] = otype(state[j]);
++    if (uniforms.state_window == 0u) {
++      for (var j = 0u; j < TILE_V; j++) {
++        if (dv_start + j < uniforms.head_dim_v) {
++          present_state[state_row + j] = otype(state[j]);
++        }
++      }
++    } else if (uniforms.zero_leading_slots != 0u) {
++      for (var slot = 0u; slot + uniforms.seq_length < uniforms.state_window; slot++) {
++        for (var j = 0u; j < TILE_V; j++) {
++          if (dv_start + j < uniforms.head_dim_v) {
++            present_state[state_row + slot * uniforms.slot_stride + j] = otype(0.0);
++          }
++        }
+       }
+     }
+   }
+diff --git a/onnxruntime/contrib_ops/webgpu/bert/skip_layer_norm.cc b/onnxruntime/contrib_ops/webgpu/bert/skip_layer_norm.cc
+index c0e3b74..06f6191 100644
+--- a/onnxruntime/contrib_ops/webgpu/bert/skip_layer_norm.cc
++++ b/onnxruntime/contrib_ops/webgpu/bert/skip_layer_norm.cc
+@@ -28,7 +28,9 @@ Status SkipLayerNormProgram::GenerateShaderCode(ShaderHelper& shader) const {
+   }
+ 
+   std::string simpl1 = (simplified_) ? "" : "- mean * mean ";
+-  std::string simpl2 = (simplified_) ? "" : "- x_element_t(mean) ";
++  std::string simpl2 = (simplified_) ? "" : "- mean ";
++  // Quick Inference patch: the output is computed in f32 (an attention sink's ~1.5e4 times a norm weight overflows f16 when
++  // the compiler multiplies those first, as Metal does).
+   if (split_hidden_dim_) {
+     shader.AdditionalImplementation()
+         << "var<workgroup> sum_shared : array<f32, workgroup_size_x>;\n"
+@@ -85,7 +87,7 @@ Status SkipLayerNormProgram::GenerateShaderCode(ShaderHelper& shader) const {
+         << "  let mean = sum_shared[0] / f32(uniforms.hidden_size);\n"
+         << "  let inv_std_dev = inverseSqrt(sum_squared_shared[0] / f32(uniforms.hidden_size) " << simpl1 << "+ uniforms.epsilon);\n"
+         << "  offset = workgroup_idx * workgroup_size_x + local_idx;\n"
+-        << "  output[offset] = ((cur_input_skip_bias_sum " << simpl2 << ") * x_element_t(inv_std_dev) * gamma[offset]" << (hasBeta_ ? " + beta[offset] " : "") << ");\n";
++        << "  output[offset] = x_value_t((vec4<f32>(cur_input_skip_bias_sum) " << simpl2 << ") * inv_std_dev * vec4<f32>(gamma[offset]))" << (hasBeta_ ? " + beta[offset]" : "") << ";\n";
+   } else {
+     int components = x.NumComponents();
+     std::string bias = (hasBias_) ? " + bias[offset1d + i] " : "";
+@@ -133,7 +135,7 @@ Status SkipLayerNormProgram::GenerateShaderCode(ShaderHelper& shader) const {
+         << "let mean = " << SumVector("sum", components) << " / f32(uniforms.hidden_size);\n"
+         << "let inv_std_dev = inverseSqrt(" << SumVector("square_sum", components) << " / f32(uniforms.hidden_size) " << simpl1 << "+ uniforms.epsilon);\n"
+         << "for (var i: u32 = 0; i < stride; i++) {\n"
+-        << " output[offset + i] = (output[offset + i] " << simpl2 << ") * x_element_t(inv_std_dev) * gamma[offset1d + i]" << beta << ";\n"
++        << " output[offset + i] = x_value_t((f32_val_t(output[offset + i]) " << simpl2 << ") * inv_std_dev * f32_val_t(gamma[offset1d + i]))" << beta << ";\n"
+         << "};\n";
+   }
+ 
+diff --git a/onnxruntime/contrib_ops/webgpu/moe/fused_final_mix_1token.wgsl.template b/onnxruntime/contrib_ops/webgpu/moe/fused_final_mix_1token.wgsl.template
+index ede7839..8041293 100644
+--- a/onnxruntime/contrib_ops/webgpu/moe/fused_final_mix_1token.wgsl.template
++++ b/onnxruntime/contrib_ops/webgpu/moe/fused_final_mix_1token.wgsl.template
+@@ -1,7 +1,7 @@
+ // Copyright (c) Microsoft Corporation. All rights reserved.
+ // Licensed under the MIT License.
+ 
+-// Fused FinalMix for 1-token MoE: processes all k experts in one dispatch.
++// Fused FinalMix for few-token MoE (Quick Inference patch: several tokens, k rows each): all k experts in one dispatch.
+ // The kernel is dispatched over hidden_size; each thread computes one output
+ // element and accumulates the weighted contributions from all k experts.
+ // in: fc2_outputs [k, hidden_size] — concatenated fc2 results for all k experts
+@@ -12,14 +12,17 @@
+ 
+ $MAIN {
+     let out_idx = workgroup_idx * workgroup_size_x + local_idx;
+-    if (out_idx >= uniforms.hidden_size) {
++    if (out_idx >= uniforms.tokens * uniforms.hidden_size) {
+         return;
+     }
++    let token = out_idx / uniforms.hidden_size;
++    let h = out_idx % uniforms.hidden_size;
+     var acc = output_element_t(0);
+     for (var i = 0u; i < uniforms.k; i++) {
+-        let expert_idx = indirect_experts[i];
+-        let router_value = router_values[expert_idx];
+-        acc += router_value * fc2_outputs[i * uniforms.hidden_size + out_idx];
++        let row = token * uniforms.k + i;
++        let expert_idx = indirect_experts[row];
++        let router_value = router_values[token * uniforms.num_experts + expert_idx];
++        acc += router_value * fc2_outputs[row * uniforms.hidden_size + h];
+     }
+     output[out_idx] = acc;
+ } // MAIN
+diff --git a/onnxruntime/contrib_ops/webgpu/moe/gate.wgsl.template b/onnxruntime/contrib_ops/webgpu/moe/gate.wgsl.template
+index c62a7a7..a4dd9b5 100644
+--- a/onnxruntime/contrib_ops/webgpu/moe/gate.wgsl.template
++++ b/onnxruntime/contrib_ops/webgpu/moe/gate.wgsl.template
+@@ -12,18 +12,15 @@
+ // uniform: rows(num_tokens), cols(num_experts), token_offset
+ //
+ 
+-#param is_fp16
+ #param k
+ 
+ const K: u32 = k;
+-#if is_fp16
+-const MAX_FLOAT: f16 = 65504.0;
+-#else
+-const MAX_FLOAT: f32 = 3.4028234663852886e+38;
+-#endif
+-
+-var<workgroup> shared_vals: array<router_logits_element_t, workgroup_size_x>;
+-var<workgroup> shared_idxs: array<u32, workgroup_size_x>;
++// workgroup_size_x is a power of two.
++const NONE: u32 = 0xffffffffu;
++var<workgroup> best_vals: array<f32, workgroup_size_x>;
++var<workgroup> best_idxs: array<u32, workgroup_size_x>;
++var<workgroup> chosen_vals: array<f32, K>;
++var<workgroup> chosen_idxs: array<u32, K>;
+ 
+ $MAIN {
+     let row = workgroup_idx;
+@@ -33,41 +30,51 @@ $MAIN {
+     let cols = uniforms.cols;
+     let output_base = row * cols;
+ 
+-    var max_val: router_logits_element_t = -MAX_FLOAT;
+-    var max_idx: u32 = 0u;
+-
+-    if (global_idx < cols) {
+-        atomicStore(&tokencount_for_expert[global_idx], 0u);
++    for (var c = local_idx; c < cols; c += workgroup_size_x) {
++        topk_values[output_base + c] = topk_values_value_t(0);
+     }
+-    if (local_idx < cols) {
+-        max_val = router_logits[(row + uniforms.token_offset) * cols + local_idx];
+-        max_idx = local_idx;
+-    }
+-    shared_vals[local_idx] = max_val;
+-    shared_idxs[local_idx] = max_idx;
+-    topk_values[output_base + local_idx] = topk_values_value_t(0);
+-    workgroupBarrier();
+-
+-    // K is small, use a simple bubble sort
+-    for (var i = 0u; i < workgroup_size_x - 1u; i++) {
+-        for (var j = 0u; j < workgroup_size_x - 1u - i; j++) {
+-            if (local_idx == j && local_idx < cols && (local_idx + 1u) < cols) {
+-                // Compare adjacent elements and swap if needed (descending order)
+-                if (shared_vals[local_idx] < shared_vals[local_idx + 1u]) {
+-                    let temp_val = shared_vals[local_idx];
+-                    let temp_idx = shared_idxs[local_idx];
+-                    shared_vals[local_idx] = shared_vals[local_idx + 1u];
+-                    shared_idxs[local_idx] = shared_idxs[local_idx + 1u];
+-                    shared_vals[local_idx + 1u] = temp_val;
+-                    shared_idxs[local_idx + 1u] = temp_idx;
++    // Quick Inference patch: top K by K rounds of a parallel argmax (a tree reduction each; ties go to the lower
++    // index, as the stable sort this replaces), instead of a bubble sort with a barrier per comparison step (about
++    // cols^2 / 2 barriers). Each thread looks at experts local_idx, local_idx + workgroup size, ...
++    for (var i = 0u; i < K; i++) {
++        var v: f32 = 0.0;
++        var idx: u32 = NONE;
++        for (var c = local_idx; c < cols; c += workgroup_size_x) {
++            var taken = false;
++            for (var j = 0u; j < i; j++) {
++                taken = taken || chosen_idxs[j] == c;
++            }
++            let x = f32(router_logits[(row + uniforms.token_offset) * cols + c]);
++            if (!taken && (idx == NONE || x > v)) {
++                v = x;
++                idx = c;
++            }
++        }
++        best_vals[local_idx] = v;
++        best_idxs[local_idx] = idx;
++        workgroupBarrier();
++        for (var s = workgroup_size_x / 2u; s > 0u; s = s / 2u) {
++            if (local_idx < s) {
++                let bv = best_vals[local_idx + s];
++                let bi = best_idxs[local_idx + s];
++                let av = best_vals[local_idx];
++                let ai = best_idxs[local_idx];
++                if (bi != NONE && (ai == NONE || bv > av || (bv == av && bi < ai))) {
++                    best_vals[local_idx] = bv;
++                    best_idxs[local_idx] = bi;
+                 }
+             }
+             workgroupBarrier();
+         }
++        if (local_idx == 0u) {
++            chosen_vals[i] = best_vals[0];
++            chosen_idxs[i] = best_idxs[0];
++        }
++        workgroupBarrier();
+     }
+     if (local_idx < K) {
+         // found the top K experts for token, write to output
+-        let expert_idx = shared_idxs[local_idx];
++        let expert_idx = chosen_idxs[local_idx];
+         let expert_base = expert_idx * uniforms.rows;
+         let target_idx = atomicAdd(&tokencount_for_expert[expert_idx], 1u);
+         hiddenstate_for_expert[expert_base + target_idx] = row + uniforms.token_offset;
+@@ -76,15 +83,15 @@ $MAIN {
+         // softmax with max-subtraction for numerical stability — without it, large
+         // logits (e.g. >= ~89 for f32) cause exp() to overflow to +inf and the
+         // ratio inf/inf becomes NaN, propagating through the rest of the kernel.
+-        // shared_vals is sorted in descending order, so shared_vals[0] is the max.
+-        let max_val = f32(shared_vals[0]);
++        // chosen_vals is in descending order, so chosen_vals[0] is the max.
++        let max_val = chosen_vals[0];
+         var sum : f32 = 0.0;
+         for (var i = 0u; i < K; i++) {
+-            sum += exp(f32(shared_vals[i]) - max_val);
++            sum += exp(chosen_vals[i] - max_val);
+         }
+         for (var i = 0u; i < K; i++) {
+-            let expert_idx = shared_idxs[i];
+-            topk_values[output_base + expert_idx] = topk_values_value_t(exp(f32(shared_vals[i]) - max_val) / sum);
++            let expert_idx = chosen_idxs[i];
++            topk_values[output_base + expert_idx] = topk_values_value_t(exp(chosen_vals[i] - max_val) / sum);
+         }
+     }
+ } // MAIN
+diff --git a/onnxruntime/contrib_ops/webgpu/moe/gate_1token.wgsl.template b/onnxruntime/contrib_ops/webgpu/moe/gate_1token.wgsl.template
+index 1de81d8..15b0f1e 100644
+--- a/onnxruntime/contrib_ops/webgpu/moe/gate_1token.wgsl.template
++++ b/onnxruntime/contrib_ops/webgpu/moe/gate_1token.wgsl.template
+@@ -9,18 +9,15 @@
+ // output: topk_values
+ // output: indirect_experts
+ 
+-#param is_fp16
+ #param k
+ 
+ const K: u32 = k;
+-#if is_fp16
+-const MAX_FLOAT: f16 = 65504.0;
+-#else
+-const MAX_FLOAT: f32 = 3.4028234663852886e+38;
+-#endif
+-
+-var<workgroup> shared_vals: array<router_logits_element_t, workgroup_size_x>;
+-var<workgroup> shared_idxs: array<u32, workgroup_size_x>;
++// workgroup_size_x is a power of two.
++const NONE: u32 = 0xffffffffu;
++var<workgroup> best_vals: array<f32, workgroup_size_x>;
++var<workgroup> best_idxs: array<u32, workgroup_size_x>;
++var<workgroup> chosen_vals: array<f32, K>;
++var<workgroup> chosen_idxs: array<u32, K>;
+ 
+ $MAIN {
+     let row = workgroup_idx;
+@@ -30,49 +27,62 @@ $MAIN {
+     let cols = uniforms.cols;
+     let output_base = row * cols;
+ 
+-    var max_val: router_logits_element_t = -MAX_FLOAT;
+-    var max_idx: u32 = 0u;
+-
+-    if (local_idx < cols) {
+-        max_val = router_logits[row * cols + local_idx];
+-        max_idx = local_idx;
++    for (var c = local_idx; c < cols; c += workgroup_size_x) {
++        topk_values[output_base + c] = topk_values_value_t(0);
+     }
+-    shared_vals[local_idx] = max_val;
+-    shared_idxs[local_idx] = max_idx;
+-    topk_values[output_base + local_idx] = topk_values_value_t(0);
+-    workgroupBarrier();
+-
+-    // K is small, use a simple bubble sort
+-    for (var i = 0u; i < workgroup_size_x - 1u; i++) {
+-        for (var j = 0u; j < workgroup_size_x - 1u - i; j++) {
+-            if (local_idx == j && local_idx < cols && (local_idx + 1u) < cols) {
+-                // Compare adjacent elements and swap if needed (descending order)
+-                if (shared_vals[local_idx] < shared_vals[local_idx + 1u]) {
+-                    let temp_val = shared_vals[local_idx];
+-                    let temp_idx = shared_idxs[local_idx];
+-                    shared_vals[local_idx] = shared_vals[local_idx + 1u];
+-                    shared_idxs[local_idx] = shared_idxs[local_idx + 1u];
+-                    shared_vals[local_idx + 1u] = temp_val;
+-                    shared_idxs[local_idx + 1u] = temp_idx;
++    // Quick Inference patch: top K by K rounds of a parallel argmax (a tree reduction each; ties go to the lower
++    // index, as the stable sort this replaces), instead of a bubble sort with a barrier per comparison step (about
++    // cols^2 / 2 barriers). Each thread looks at experts local_idx, local_idx + workgroup size, ...
++    for (var i = 0u; i < K; i++) {
++        var v: f32 = 0.0;
++        var idx: u32 = NONE;
++        for (var c = local_idx; c < cols; c += workgroup_size_x) {
++            var taken = false;
++            for (var j = 0u; j < i; j++) {
++                taken = taken || chosen_idxs[j] == c;
++            }
++            let x = f32(router_logits[row * cols + c]);
++            if (!taken && (idx == NONE || x > v)) {
++                v = x;
++                idx = c;
++            }
++        }
++        best_vals[local_idx] = v;
++        best_idxs[local_idx] = idx;
++        workgroupBarrier();
++        for (var s = workgroup_size_x / 2u; s > 0u; s = s / 2u) {
++            if (local_idx < s) {
++                let bv = best_vals[local_idx + s];
++                let bi = best_idxs[local_idx + s];
++                let av = best_vals[local_idx];
++                let ai = best_idxs[local_idx];
++                if (bi != NONE && (ai == NONE || bv > av || (bv == av && bi < ai))) {
++                    best_vals[local_idx] = bv;
++                    best_idxs[local_idx] = bi;
+                 }
+             }
+             workgroupBarrier();
+         }
++        if (local_idx == 0u) {
++            chosen_vals[i] = best_vals[0];
++            chosen_idxs[i] = best_idxs[0];
++        }
++        workgroupBarrier();
+     }
+     if (local_idx == 0u) {
+         // softmax with max-subtraction for numerical stability — without it, large
+         // logits (e.g. >= ~89 for f32) cause exp() to overflow to +inf and the
+         // ratio inf/inf becomes NaN, propagating through the rest of the kernel.
+-        // shared_vals is sorted in descending order, so shared_vals[0] is the max.
+-        let max_val = f32(shared_vals[0]);
++        // chosen_vals is in descending order, so chosen_vals[0] is the max.
++        let max_val = chosen_vals[0];
+         var sum : f32 = 0.0;
+         for (var i = 0u; i < K; i++) {
+-            sum += exp(f32(shared_vals[i]) - max_val);
++            sum += exp(chosen_vals[i] - max_val);
+         }
+         for (var i = 0u; i < K; i++) {
+-            let expert_idx = shared_idxs[i];
+-            topk_values[output_base + expert_idx] = topk_values_value_t(exp(f32(shared_vals[i]) - max_val) / sum);
+-            indirect_experts[i] = expert_idx;
++            let expert_idx = chosen_idxs[i];
++            topk_values[output_base + expert_idx] = topk_values_value_t(exp(chosen_vals[i] - max_val) / sum);
++            indirect_experts[row * K + i] = expert_idx;
+         }
+     }
+ } // MAIN
 diff --git a/onnxruntime/contrib_ops/webgpu/moe/moe.h b/onnxruntime/contrib_ops/webgpu/moe/moe.h
 index 332aa39..f8e7d2e 100755
 --- a/onnxruntime/contrib_ops/webgpu/moe/moe.h
@@ -26,10 +695,88 @@ index bab99fe..c24009f 100755
  
  enum class MoEQuantType {
 diff --git a/onnxruntime/contrib_ops/webgpu/moe/qmoe.cc b/onnxruntime/contrib_ops/webgpu/moe/qmoe.cc
-index b2797db..f2d5409 100755
+index b2797db..b3b46fc 100755
 --- a/onnxruntime/contrib_ops/webgpu/moe/qmoe.cc
 +++ b/onnxruntime/contrib_ops/webgpu/moe/qmoe.cc
-@@ -124,6 +124,43 @@ class SwigLuProgram final : public Program<SwigLuProgram> {
+@@ -19,7 +19,7 @@ using onnxruntime::webgpu::ComputeContext;
+ 
+ class GateProgram final : public Program<GateProgram> {
+  public:
+-  GateProgram(int k, bool is_fp16) : Program<GateProgram>{"QmoeGate"}, k_{k}, is_fp16_{is_fp16} {};
++  explicit GateProgram(int k) : Program<GateProgram>{"QmoeGate"}, k_{k} {};
+ 
+   Status GenerateShaderCode(ShaderHelper& shader) const override {
+     shader.AddInput("router_logits", ShaderUsage::UseElementTypeAlias);
+@@ -28,7 +28,6 @@ class GateProgram final : public Program<GateProgram> {
+     shader.AddOutput("tokencount_for_expert");
+ 
+     return WGSL_TEMPLATE_APPLY(shader, "moe/gate.wgsl.template",
+-                               WGSL_TEMPLATE_PARAMETER(is_fp16, is_fp16_),
+                                WGSL_TEMPLATE_PARAMETER(k, k_));
+   };
+ 
+@@ -39,12 +38,11 @@ class GateProgram final : public Program<GateProgram> {
+ 
+  private:
+   int k_;
+-  bool is_fp16_;
+ };
+ 
+ class Gate1TokenProgram final : public Program<Gate1TokenProgram> {
+  public:
+-  Gate1TokenProgram(int k, bool is_fp16) : Program<Gate1TokenProgram>{"QmoeGate1Token"}, k_{k}, is_fp16_{is_fp16} {};
++  explicit Gate1TokenProgram(int k) : Program<Gate1TokenProgram>{"QmoeGate1Token"}, k_{k} {};
+ 
+   Status GenerateShaderCode(ShaderHelper& shader) const override {
+     shader.AddInput("router_logits", ShaderUsage::UseElementTypeAlias);
+@@ -52,7 +50,6 @@ class Gate1TokenProgram final : public Program<Gate1TokenProgram> {
+     shader.AddOutput("indirect_experts");
+ 
+     return WGSL_TEMPLATE_APPLY(shader, "moe/gate_1token.wgsl.template",
+-                               WGSL_TEMPLATE_PARAMETER(is_fp16, is_fp16_),
+                                WGSL_TEMPLATE_PARAMETER(k, k_));
+   };
+ 
+@@ -62,7 +59,6 @@ class Gate1TokenProgram final : public Program<Gate1TokenProgram> {
+ 
+  private:
+   int k_;
+-  bool is_fp16_;
+ };
+ 
+ class HiddenStateGatherProgram final : public Program<HiddenStateGatherProgram> {
+@@ -102,6 +98,30 @@ class ZeroTensorProgram final : public Program<ZeroTensorProgram> {
+  private:
+ };
+ 
++// Quick Inference patch: clears the per-expert token counts before the gate (the gate cleared them itself from
++// workgroup 0, racing the other workgroups' atomic adds).
++class ZeroCountsProgram final : public Program<ZeroCountsProgram> {
++ public:
++  ZeroCountsProgram() : Program<ZeroCountsProgram>{"QmoeZeroCounts"} {}
++
++  Status GenerateShaderCode(ShaderHelper& shader) const override {
++    shader.AddOutput("counts", ShaderUsage::None);
++    shader.MainFunctionBody() << shader.GuardAgainstOutOfBoundsWorkgroupSizes("uniforms.size")
++                              << "  counts[global_idx] = 0u;\n";
++    return Status::OK();
++  }
++
++  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES({"size", ProgramUniformVariableDataType::Uint32});
++};
++
++// Quick Inference patch: the gates' workgroup size, a power of two (their top K reduces over it); each thread takes
++// every workgroup-size-th expert.
++static uint32_t GateWorkgroupSize(uint32_t num_experts) {
++  uint32_t size = 32;
++  while (size < num_experts && size < 256) size *= 2;
++  return size;
++}
++
+ class SwigLuProgram final : public Program<SwigLuProgram> {
+  public:
+   SwigLuProgram() : Program<SwigLuProgram>{"SwigLu"} {
+@@ -124,6 +144,43 @@ class SwigLuProgram final : public Program<SwigLuProgram> {
   private:
  };
  
@@ -73,12 +820,89 @@ index b2797db..f2d5409 100755
  class FusedFinalMix1TokenProgram final : public Program<FusedFinalMix1TokenProgram> {
   public:
    FusedFinalMix1TokenProgram() : Program<FusedFinalMix1TokenProgram>{"QmoeFusedFinalMix1Token"} {}
-@@ -285,7 +322,15 @@ Status QMoE::ComputeInternal(ComputeContext& context) const {
+@@ -138,7 +195,9 @@ class FusedFinalMix1TokenProgram final : public Program<FusedFinalMix1TokenProgr
+ 
+   WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
+       {"hidden_size", ProgramUniformVariableDataType::Uint32},
+-      {"k", ProgramUniformVariableDataType::Uint32});
++      {"k", ProgramUniformVariableDataType::Uint32},
++      {"num_experts", ProgramUniformVariableDataType::Uint32},
++      {"tokens", ProgramUniformVariableDataType::Uint32});
+ };
+ 
+ class QMoEFinalMixProgram final : public Program<QMoEFinalMixProgram> {
+@@ -233,27 +292,31 @@ Status QMoE::ComputeInternal(ComputeContext& context) const {
+ 
+   Tensor* output_tensor = context.Output(0, input_shape);
+ 
+-  if (moe_params.num_rows == 1) {
++  // Quick Inference patch: up to kMaxFusedTokens tokens (checking speculative guesses) take this path too, k rows
++  // per token; the per-expert loop below reads the gate's counts back to the CPU at every layer.
++  constexpr int64_t kMaxFusedTokens = 8;
++  if (moe_params.num_rows <= kMaxFusedTokens) {
+     // Fused MoE path for 1 token: instead of looping k times with separate dispatches,
+     // run a single batched MatMulNBits with M=k where each row uses a different expert's
+     // weights via weight_index_indirect. A's single row is broadcast to all k rows.
+     // This reduces dispatches from 1 + k*4 = 17 to 5 (gate + fc1 + swiglu + fc2 + mix).
+ 
+     const uint32_t k = static_cast<uint32_t>(k_);
+-    const uint32_t num_tokens = 1;
++    const uint32_t num_tokens = static_cast<uint32_t>(moe_params.num_rows);
++    const uint32_t rows = num_tokens * k;
+     TensorShape gate_value_shape({num_tokens, num_experts});
+-    TensorShape indirect_experts_shape({k});
++    TensorShape indirect_experts_shape({rows});
+ 
+     Tensor router_values = context.CreateGPUTensor(dtype, gate_value_shape);
+     Tensor indirect_experts = context.CreateGPUTensor(dtype_uint32, indirect_experts_shape);
+ 
+     // Step 1: Gate — select top-k experts
+-    Gate1TokenProgram gate{k_, is_fp16};
++    Gate1TokenProgram gate{k_};
+     gate
+         .AddInputs({{router_logits, ProgramTensorMetadataDependency::Type}})
+         .AddOutput({&router_values, ProgramTensorMetadataDependency::None})
+         .AddOutput({&indirect_experts, ProgramTensorMetadataDependency::None})
+-        .SetWorkgroupSize(num_experts)
++        .SetWorkgroupSize(GateWorkgroupSize(num_experts))
+         .SetDispatchGroupSize(num_tokens)
+         .AddUniformVariables({num_tokens, num_experts})
+         .CacheHint(k_, is_fp16 ? "fp16" : "fp32");
+@@ -261,15 +324,15 @@ Status QMoE::ComputeInternal(ComputeContext& context) const {
+ 
+     // Step 2: Batched fc1 MatMulNBits with M=k, per-row expert selection.
+     // A is (1, hidden_size) but dispatched with override_M=k; shader broadcasts A row 0.
+-    TensorShape fc1_output_shape({static_cast<int64_t>(k), fc1_output_size});
++    TensorShape fc1_output_shape({static_cast<int64_t>(rows), fc1_output_size});
+     Tensor fc1_outputs = context.CreateGPUTensor(dtype, fc1_output_shape);
+     status = ApplyMatMulNBits(hidden_state, fc1_experts_weights, fc1_scales, nullptr, fc1_experts_bias_optional,
+                               K_fc1, N_fc1, block_size_fc1, accuracy_level, expert_weight_bits_, context,
+-                              &fc1_outputs, 0, &indirect_experts, /*override_M=*/k);
++                              &fc1_outputs, 0, &indirect_experts, /*override_M=*/rows);
+     ORT_RETURN_IF_ERROR(status);
+ 
+     // Step 3: SwiGLU on all k rows at once
+-    TensorShape fc1_activated_shape({static_cast<int64_t>(k), moe_params.inter_size});
++    TensorShape fc1_activated_shape({static_cast<int64_t>(rows), moe_params.inter_size});
+     Tensor fc1_activated = context.CreateGPUTensor(dtype, fc1_activated_shape);
+     if (is_swiglu) {
+       SwigLuProgram swiglu;
+@@ -277,20 +340,28 @@ Status QMoE::ComputeInternal(ComputeContext& context) const {
+           .AddInputs({{&fc1_outputs, ProgramTensorMetadataDependency::Type, 2}})
+           .AddOutput({&fc1_activated, ProgramTensorMetadataDependency::None})
+           .SetWorkgroupSize(128)
+-          .SetDispatchGroupSize(((k * static_cast<uint32_t>(moe_params.inter_size)) + 127) / 128)
+-          .AddUniformVariables({k,
++          .SetDispatchGroupSize(((rows * static_cast<uint32_t>(moe_params.inter_size)) + 127) / 128)
++          .AddUniformVariables({rows,
+                                 static_cast<uint32_t>(moe_params.inter_size),
+                                 activation_alpha_,
+                                 activation_beta_,
                                  swiglu_limit_});
        ORT_RETURN_IF_ERROR(context.RunProgram(swiglu));
      } else {
 -      ORT_THROW("only swiglu is supported for WebGPU.");
-+      const uint32_t size = k * static_cast<uint32_t>(moe_params.inter_size);
++      const uint32_t size = rows * static_cast<uint32_t>(moe_params.inter_size);
 +      MoEActivationProgram activation{activation_type_};
 +      activation.AddInputs({{&fc1_outputs, ProgramTensorMetadataDependency::Type}})
 +          .AddOutput({&fc1_activated, ProgramTensorMetadataDependency::None})
@@ -90,7 +914,47 @@ index b2797db..f2d5409 100755
      }
  
      // Step 4: Batched fc2 MatMulNBits with M=k, per-row expert selection
-@@ -422,7 +467,15 @@ Status QMoE::ComputeInternal(ComputeContext& context) const {
+     // fc1_activated already has k rows (one per expert), no override_M needed.
+-    TensorShape fc2_output_shape({static_cast<int64_t>(k), N_fc2});
++    TensorShape fc2_output_shape({static_cast<int64_t>(rows), N_fc2});
+     Tensor fc2_outputs = context.CreateGPUTensor(dtype, fc2_output_shape);
+     status = ApplyMatMulNBits(&fc1_activated, fc2_experts_weights, fc2_scales, nullptr, fc2_experts_bias_optional,
+                               K_fc2, N_fc2, block_size_fc2, accuracy_level, expert_weight_bits_, context,
+@@ -307,8 +378,8 @@ Status QMoE::ComputeInternal(ComputeContext& context) const {
+         .AddInputs({{&indirect_experts, ProgramTensorMetadataDependency::Type}})
+         .AddOutput({output_tensor, ProgramTensorMetadataDependency::None})
+         .SetWorkgroupSize(mix_wg_size)
+-        .SetDispatchGroupSize((hidden_size + mix_wg_size - 1) / mix_wg_size)
+-        .AddUniformVariables({hidden_size, k});
++        .SetDispatchGroupSize((num_tokens * hidden_size + mix_wg_size - 1) / mix_wg_size)
++        .AddUniformVariables({hidden_size, k, num_experts, num_tokens});
+     ORT_RETURN_IF_ERROR(context.RunProgram(final_mix));
+ 
+     return Status::OK();
+@@ -345,13 +416,20 @@ Status QMoE::ComputeInternal(ComputeContext& context) const {
+     //  token_idx is the global index into hidden_state
+     Tensor gate_hidden = context.CreateGPUTensor(dtype_uint32, gate_hidden_shape);
+ 
+-    GateProgram gate{k_, is_fp16};
++    ZeroCountsProgram zero_counts;
++    zero_counts
++        .AddOutput({&gate_counts, ProgramTensorMetadataDependency::None})
++        .SetDispatchGroupSize((num_experts + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE)
++        .AddUniformVariables({num_experts});
++    ORT_RETURN_IF_ERROR(context.RunProgram(zero_counts));
++
++    GateProgram gate{k_};
+     gate
+         .AddInputs({{router_logits, ProgramTensorMetadataDependency::Type}})
+         .AddOutput({&router_values, ProgramTensorMetadataDependency::None})
+         .AddOutput({&gate_hidden, ProgramTensorMetadataDependency::None})
+         .AddOutput({&gate_counts, ProgramTensorMetadataDependency::None, ProgramOutput::Atomic})
+-        .SetWorkgroupSize(num_experts)
++        .SetWorkgroupSize(GateWorkgroupSize(num_experts))
+         .SetDispatchGroupSize(static_cast<uint32_t>(num_tokens))
+         .AddUniformVariables({static_cast<uint32_t>(num_tokens), num_experts, static_cast<uint32_t>(token_offset)})
+         .CacheHint(k_, is_fp16 ? "fp16" : "fp32");
+@@ -422,7 +500,15 @@ Status QMoE::ComputeInternal(ComputeContext& context) const {
                                    swiglu_limit_});
          ORT_RETURN_IF_ERROR(context.RunProgram(swiglu));
        } else {
@@ -107,19 +971,38 @@ index b2797db..f2d5409 100755
        }
  
        //
+diff --git a/onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_small_m.wgsl.template b/onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_small_m.wgsl.template
+index 027fc77..1e9857c 100644
+--- a/onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_small_m.wgsl.template
++++ b/onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_small_m.wgsl.template
+@@ -68,10 +68,10 @@ $MAIN {
+         return;
+     }
+     let a_global = u32((workgroup_idx / uniforms.num_N_tile) % uniforms.dispatch_M);
+-    // When broadcast_a_row is true, A has only 1 row but M=k for dispatch.
+-    // Always read from A row 0; a_global is used for output row and weight selection.
++    // When broadcast_a_row is true, each row of A serves dispatch_M / M consecutive output rows (Quick Inference patch:
++    // several tokens' experts; one token: always row 0); a_global is used for output row and weight selection.
+ #if broadcast_a_row
+-    let a_row = 0u;
++    let a_row = a_global / (uniforms.dispatch_M / uniforms.M);
+ #else
+     let a_row = a_global;
+ #endif
 diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
-index 45baa67..57773bd 100644
+index 45baa67..62ded92 100644
 --- a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
 +++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
-@@ -8,6 +8,7 @@
+@@ -8,6 +8,8 @@
  #include "contrib_ops/webgpu/quantization/matmul_nbits_common.h"
  #include "contrib_ops/webgpu/quantization/subgroup_matrix_matmul_nbits.h"
  #include "contrib_ops/webgpu/quantization/dp4a_matmul_nbits.h"
 +#include "contrib_ops/webgpu/quantization/matmul_nbits_q2_decode.h"
++#include "contrib_ops/webgpu/quantization/matmul_nbits_q4_decode.h"
  #include "contrib_ops/webgpu/webgpu_contrib_kernels.h"
  #include "core/providers/cpu/math/matmul_helper.h"
  #include "core/providers/webgpu/shader_helper.h"
-@@ -245,8 +246,14 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
+@@ -245,8 +247,20 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
      return ApplyDP4AMatrixMatMulNBits(a, b, scales, zero_points, bias, batch_count, M, dispatch_M, N, K, block_size, zero_blocks_per_col, kMinMForTileOptimization, static_cast<uint32_t>(nbits), context, y, weight_index, weight_index_indirect);
    }
  
@@ -129,13 +1012,36 @@ index 45baa67..57773bd 100644
 +    return ApplyMatMulNBitsQ2Decode(a, b, scales, bias, M, N, K, block_size, context, y);
 +  }
 +
++  // Quick Inference patch: 4-bit weights, few rows of A (see matmul_nbits_q4_decode.h).
++  if (!broadcast_a && CanApplyMatMulNBitsQ4Decode(static_cast<uint32_t>(nbits), has_zero_points, has_weight_idx, single_scale_weights,
++                                                  block_size, K, batch_count, M)) {
++    return ApplyMatMulNBitsQ4Decode(a, b, scales, zero_points, bias, M, N, K, block_size, context, y);
++  }
++
    // WideTileProgram
 -  // This program is optimized for Block32 prefill.
 +  // This program is optimized for prefill with blocks of 32 (or of a multiple of 32, walked 32 at a time).
    const bool use_wide_tile_program = CanApplyWideTileMatMulNBits(M,
                                                                   K,
                                                                   block_size,
-@@ -316,7 +323,9 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
+@@ -259,10 +273,13 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
+     // Enforce output components to 1.
+     components = 1;
+ 
+-    constexpr uint32_t workgroup_size = 128;
+-    constexpr uint32_t tile_n = workgroup_size;
++    // Quick Inference patch: a few rows of A (checking guessed tokens) get 8-row tiles from 64-thread workgroups
++    // instead of 32-row ones, which would compute 32 rows for 8.
+     const bool is_f16 = a->DataType() == DataTypeImpl::GetType<MLFloat16>();
+-    const uint32_t tile_m = is_f16 ? 2 * workgroup_size / 8 : workgroup_size / 8;
++    const bool few_rows = dispatch_M <= 8;  // (4-bit few-row products take the decode program instead: matmul_nbits_q4_decode.h)
++    const uint32_t workgroup_size = few_rows ? 64u : 128u;
++    const uint32_t tile_n = workgroup_size;
++    const uint32_t tile_m = few_rows ? workgroup_size / 8 : (is_f16 ? 2 * workgroup_size / 8 : workgroup_size / 8);
+     const uint32_t num_N_tile = CeilDiv(N, tile_n);
+     const uint32_t num_M_tile = CeilDiv(dispatch_M, tile_m);
+ 
+@@ -316,7 +333,9 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
                                   {zero_blocks_per_col},
                                   {num_N_tile},
                                   {num_M_tile},
@@ -161,11 +1067,29 @@ index bf56d4f..605949d 100644
  
   private:
    bool has_zero_points_;
+diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.wgsl.template b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.wgsl.template
+index 58f4baa..6e14b18 100644
+--- a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.wgsl.template
++++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.wgsl.template
+@@ -59,10 +59,10 @@ $MAIN {
+ #endif
+   let b_global_base = (workgroup_idx % uniforms.num_N_tile) * tile_size;
+ 
+-  // When broadcast_a_row is true, A has only 1 row but M=k for dispatch.
+-  // Always read from A row 0; a_global is used for output row and weight selection.
++  // When broadcast_a_row is true, each row of A serves dispatch_M / M consecutive output rows (Quick Inference patch:
++  // several tokens' experts; one token: always row 0); a_global is used for output row and weight selection.
+ #if broadcast_a_row
+-  let a_row = 0u;
++  let a_row = a_global / (uniforms.dispatch_M / uniforms.M);
+ #else
+   let a_row = a_global;
+ #endif
 diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_common.cc b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_common.cc
-index 34d9ff4..710266e 100644
+index 34d9ff4..c1e8844 100644
 --- a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_common.cc
 +++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_common.cc
-@@ -86,7 +86,8 @@ bool CanApplyWideTileMatMulNBits(uint32_t M,
+@@ -86,11 +86,12 @@ bool CanApplyWideTileMatMulNBits(uint32_t M,
      components_b = onnxruntime::webgpu::GetMaxComponents(blob_size_in_words);
    }
  
@@ -175,6 +1099,83 @@ index 34d9ff4..710266e 100644
           components_a == 4 &&
           components_b == 4 &&
           nbits != 2 &&
+-         M >= kMinMForTileOptimization;
++         M >= 2;  // Quick Inference patch: from 2 rows (short checking passes get 8-row tiles: matmul_nbits.cc)
+ }
+ 
+ }  // namespace webgpu
+diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_mlp.cc b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_mlp.cc
+index ccb5454..e235faf 100644
+--- a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_mlp.cc
++++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_mlp.cc
+@@ -2,6 +2,7 @@
+ // Licensed under the MIT License.
+ 
+ #include "contrib_ops/webgpu/quantization/matmul_nbits_mlp.h"
++#include "contrib_ops/webgpu/quantization/matmul_nbits_q4_decode.h"
+ 
+ #include <optional>
+ 
+@@ -327,6 +328,30 @@ Status MatMulNBitsMlp::ComputeInternal(onnxruntime::webgpu::ComputeContext& cont
+       !would_use_dp4a_unfused &&
+       !would_use_wide_tile_unfused;
+ 
++  // Quick Inference patch: a few rows of A (decoding, checking guessed tokens) go to the 4-bit decode program's gated
++  // form, after the norm.
++  if (gate_bias == nullptr && up_bias == nullptr && activation_kind_ == MlpActivationKind::Silu &&
++      CanApplyMatMulNBitsQ4Decode(static_cast<uint32_t>(bits_), /*has_zero_points=*/false, /*has_weight_idx=*/false,
++                                  single_scale_weights, block_size, K, batch_count, M)) {
++    const Tensor* gated_a = a;
++    std::optional<Tensor> normalized;
++    if (has_norm_input) {
++      normalized.emplace(context.CreateGPUTensor(a->DataType(), a->Shape()));
++      if (has_skip_input) {
++        ORT_RETURN_IF_ERROR(RunSkipLayerNormProgram(context, a, skip, norm_scale, /*beta=*/nullptr, /*bias=*/nullptr,
++                                                    epsilon_, /*simplified=*/true, &*normalized, input_skip_bias_sum));
++      } else {
++        const int64_t norm_size = a->Shape()[a->Shape().NumDimensions() - 1];
++        ORT_RETURN_IF_ERROR(onnxruntime::webgpu::RunLayerNormProgram(
++            context, a, norm_scale, /*bias=*/nullptr, epsilon_,
++            onnxruntime::narrow<uint32_t>(a->Shape().Size() / norm_size), onnxruntime::narrow<uint32_t>(norm_size),
++            /*simplified=*/true, &*normalized, /*mean=*/nullptr, /*inv_std_dev=*/nullptr));
++      }
++      gated_a = &*normalized;
++    }
++    return ApplyMatMulNBitsQ4DecodeGated(gated_a, gate_b, gate_scales, up_b, up_scales, M, N, K, block_size, context, y);
++  }
++
+   if (can_use_decode_fast_path) {
+     ORT_ENFORCE(bits_ == kFusedDecodeFastPathBits,
+                 "MatMulNBitsMlpDecodeProgram is specialized for 4-bit weights only.");
+diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_mlp.wgsl.template b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_mlp.wgsl.template
+index f64f0d3..1fab564 100644
+--- a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_mlp.wgsl.template
++++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_mlp.wgsl.template
+@@ -28,6 +28,15 @@
+ #if has_norm_input
+ var<workgroup> sum_squared_shared : array<f32, workgroup_size_x>;
+ #endif
++// Quick Inference patch: the norm is applied in f32 (an attention sink's ~1.5e4 times a norm weight overflows f16 when the
++// compiler multiplies those first, as Metal does).
++#if component_a == 1
++alias a_f32_t = f32;
++#elif component_a == 2
++alias a_f32_t = vec2<f32>;
++#else
++alias a_f32_t = vec4<f32>;
++#endif
+ var<workgroup> tile_A : array<input_a_value_t, a_length_per_tile>;
+ var<workgroup> gate_inter_results : array<array<output_element_t, tile_size_k_vec + 1>, tile_size>;
+ var<workgroup> up_inter_results : array<array<output_element_t, tile_size_k_vec + 1>, tile_size>;
+@@ -55,7 +64,7 @@ fn loadSHMA(batch: u32, b_global_base: u32, kidx: u32, col: u32, inv_std: f32)
+         }
+ #endif
+ #if has_norm_input
+-        tile_A[col] = merged_value * input_a_value_t(input_a_element_t(inv_std)) * norm_scale.getByOffset(k_offset);
++        tile_A[col] = input_a_value_t(a_f32_t(merged_value) * inv_std * a_f32_t(norm_scale.getByOffset(k_offset)));
+ #else
+         tile_A[col] = merged_value;
+ #endif
 diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_q2_decode.cc b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_q2_decode.cc
 new file mode 100644
 index 0000000..a094acc
@@ -352,8 +1353,320 @@ index 0000000..4632d51
 +}  // namespace webgpu
 +}  // namespace contrib
 +}  // namespace onnxruntime
+diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_q4_decode.cc b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_q4_decode.cc
+new file mode 100644
+index 0000000..e21524b
+--- /dev/null
++++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_q4_decode.cc
+@@ -0,0 +1,212 @@
++// Copyright (c) Quick Inference contributors.
++// Licensed under the MIT License.
++// Quick Inference patch: see matmul_nbits_q4_decode.h.
++
++#include "contrib_ops/webgpu/quantization/matmul_nbits_q4_decode.h"
++
++#include "core/providers/webgpu/shader_helper.h"
++#include "core/providers/webgpu/webgpu_utils.h"
++
++namespace onnxruntime {
++namespace contrib {
++namespace webgpu {
++
++namespace {
++// Teams (rows) per workgroup.
++constexpr uint32_t kQ4DecodeTeams = 4;
++// Rows of W per team when A has several rows: each value of A loaded is used for all of them.
++constexpr uint32_t kQ4DecodeRowsPerTeam = 4;
++}  // namespace
++
++// Most rows of A per dispatch (the rest of a longer A goes to the wide-tile program).
++constexpr uint32_t kQ4DecodeMaxRows = 8;
++
++Status MatMulNBitsQ4DecodeProgram::GenerateShaderCode(ShaderHelper& shader) const {
++  shader.AddInput("input_a", ShaderUsage::UseValueTypeAlias);
++  // Weight matrices: one, or gate and up (gated: the output is silu(gate) * up).
++  const std::vector<std::string> matrices = gated_ ? std::vector<std::string>{"gate", "up"} : std::vector<std::string>{"input"};
++  for (const auto& name : matrices) {
++    shader.AddInput(name + "_b");
++    shader.AddInput(name + "_scales");
++    if (has_zero_points_) {
++      shader.AddInput(name + "_zero_points");
++    }
++  }
++  if (has_bias_) {
++    shader.AddInput("bias");
++  }
++  shader.AddOutput("output", ShaderUsage::UseElementTypeAlias);
++
++  shader.AdditionalImplementation()
++      << "const TEAMS: u32 = " << kQ4DecodeTeams << "u;\n"
++      << "const M: u32 = " << rows_ << "u;\n";
++  if (f16_) {
++    // Codes c and c + 4 of a word shifted by 4c sit in the two halves of (word >> 4c) & 0x000F000F; OR-ing
++    // 0x64006400 makes them the f16 values 1024 + code.
++    shader.AdditionalImplementation()
++        << "fn pair(word: u32, shift: u32) -> vec2<f16> {\n"
++        << "  return bitcast<vec2<f16>>(((word >> shift) & 0x000F000Fu) | 0x64006400u);\n"
++        << "}\n";
++  } else {
++    // Four codes from shifts (0, 4, 8, 12) + base OR-ed into 0x4b000000 are the f32 values 2^23 + code; `offset` is
++    // 2^23 + the zero point.
++    shader.AdditionalImplementation()
++        << "fn quad(word: u32, base: u32, offset: f32) -> vec4<f32> {\n"
++        << "  let codes = (vec4<u32>(word) >> (vec4<u32>(0u, 4u, 8u, 12u) + vec4<u32>(base))) & vec4<u32>(15u);\n"
++        << "  return bitcast<vec4<f32>>(codes | vec4<u32>(0x4b000000u)) - vec4<f32>(offset);\n"
++        << "}\n";
++  }
++  if (!use_subgroups_) {
++    shader.AdditionalImplementation() << "var<workgroup> partial: array<f32, " << kQ4DecodeTeams * 32 << ">;\n";
++  }
++
++  // Weight rows a lane works on, unrolled here (no indexing of register arrays): rows_per_team_ of each matrix.
++  const uint32_t R = rows_per_team_;
++  const uint32_t W = R * static_cast<uint32_t>(matrices.size());
++  auto matrix = [&](uint32_t w) { return matrices[w / R]; };
++  auto row = [&](uint32_t w) { return "min(first + " + std::to_string(w % R) + "u, uniforms.N - 1u)"; };
++
++  auto& body = shader.MainFunctionBody();
++  body << "  let team = local_idx / 32u;\n"
++       << "  let lane = local_idx % 32u;\n"
++       << "  let first = (workgroup_idx * TEAMS + team) * " << R << "u;\n";
++  for (uint32_t w = 0; w < W; w++) body << "  var acc" << w << ": array<f32, M>;\n";
++  body << "  for (var s = lane; s < uniforms.steps; s += 32u) {\n";
++  // A step's products are summed in f16 for f16 models (f32 for f32 ones).
++  const std::string t = f16_ ? "f16" : "f32";
++  // f16: weights are scaled before the products (unscaled codes times large activations, such as an attention sink's
++  // ~2e4, would overflow f16 within a step); f32: the scale is applied to the step's sum.
++  for (uint32_t w = 0; w < W; w++) {
++    body << "    let q" << w << " = " << matrix(w) << "_b[" << row(w) << " * uniforms.steps + s];\n"
++         << "    let scale" << w << " = " << t << "(" << matrix(w) << "_scales[" << row(w) << " * uniforms.blocks_per_col + s / uniforms.steps_per_block]);\n"
++         << "    var part" << w << ": array<" << t << ", M>;\n";
++    // What a code's float value (1024 + code in f16, 2^23 + code in f32) loses to become code - zero point.
++    const std::string base = f16_ ? "1024" : "8388608";
++    if (has_zero_points_) {
++      body << "    let zo" << w << " = " << row(w) << " * uniforms.zero_blocks_per_col + s / uniforms.steps_per_block;\n"
++           << "    let offset" << w << " = " << t << "(" << base << "u + ((" << matrix(w) << "_zero_points[zo" << w << " / 8u] >> ((zo" << w << " % 8u) * 4u)) & 15u));\n";
++    } else {
++      body << "    let offset" << w << " = " << t << "(" << base << "u + 8u);\n";
++    }
++  }
++  body << "    for (var j = 0u; j < 4u; j++) {\n";
++  for (uint32_t w = 0; w < W; w++) {
++    if (f16_) {
++      body << "      let a" << w << " = pair(q" << w << "[j], 0u); let b" << w << " = pair(q" << w << "[j], 4u); "
++           << "let c" << w << " = pair(q" << w << "[j], 8u); let d" << w << " = pair(q" << w << "[j], 12u);\n"
++           << "      let lo" << w << " = (vec4<f16>(a" << w << ".x, b" << w << ".x, c" << w << ".x, d" << w << ".x) - vec4<f16>(offset" << w << ")) * scale" << w << ";\n"
++           << "      let hi" << w << " = (vec4<f16>(a" << w << ".y, b" << w << ".y, c" << w << ".y, d" << w << ".y) - vec4<f16>(offset" << w << ")) * scale" << w << ";\n";
++    } else {
++      body << "      let lo" << w << " = quad(q" << w << "[j], 0u, offset" << w << "); let hi" << w << " = quad(q" << w << "[j], 16u, offset" << w << ");\n";
++    }
++  }
++  body << "      for (var m = 0u; m < M; m++) {\n"
++       << "        let i = (m * uniforms.steps + s) * 8u + j * 2u;\n"
++       << "        let x0 = vec4<" << t << ">(input_a[i]); let x1 = vec4<" << t << ">(input_a[i + 1u]);\n";
++  for (uint32_t w = 0; w < W; w++) body << "        part" << w << "[m] += dot(x0, lo" << w << ") + dot(x1, hi" << w << ");\n";
++  body << "      }\n"
++       << "    }\n";
++  for (uint32_t w = 0; w < W; w++) {
++    body << "    for (var m = 0u; m < M; m++) { acc" << w << "[m] += " << (f16_ ? "f32(part" + std::to_string(w) + "[m])" : "scale" + std::to_string(w) + " * part" + std::to_string(w) + "[m]") << "; }\n";
++  }
++  body << "  }\n";
++
++  // Sums across the team's 32 lanes: subgroups of exactly 32 lanes (checked on the host) are a team.
++  auto reduce = [&](const std::string& value, const std::string& out) {
++    if (use_subgroups_) {
++      body << "      let " << out << " = subgroupAdd(" << value << ");\n";
++    } else {
++      body << "      partial[local_idx] = " << value << ";\n"
++           << "      workgroupBarrier();\n"
++           << "      for (var stride = 16u; stride > 0u; stride = stride / 2u) {\n"
++           << "        if (lane < stride) { partial[local_idx] += partial[local_idx + stride]; }\n"
++           << "        workgroupBarrier();\n"
++           << "      }\n"
++           << "      let " << out << " = partial[local_idx - lane];\n"
++           << "      workgroupBarrier();\n";
++    }
++  };
++  const std::string bias = has_bias_ ? " + f32(bias[row])" : "";
++  for (uint32_t r = 0; r < R; r++) {
++    body << "  {\n"
++         << "    let row = first + " << r << "u;\n"
++         << "    for (var m = 0u; m < M; m++) {\n";
++    reduce("acc" + std::to_string(r) + "[m]", "total");
++    if (gated_) {
++      reduce("acc" + std::to_string(r + R) + "[m]", "up");
++      body << "      if (lane == 0u && row < uniforms.N) { output[m * uniforms.N + row] = output_element_t(total / (1.0 + exp(-total)) * up); }\n";
++    } else {
++      body << "      if (lane == 0u && row < uniforms.N) { output[m * uniforms.N + row] = output_element_t(total" << bias << "); }\n";
++    }
++    body << "    }\n"
++         << "  }\n";
++  }
++  return Status::OK();
++}
++
++bool CanApplyMatMulNBitsQ4Decode(uint32_t nbits, bool has_zero_points, bool has_weight_idx, bool single_scale_weights,
++                                 uint32_t block_size, uint32_t K, uint32_t batch_count, uint32_t M) {
++  // Longer A (prompts) goes to the wide-tile program. Zero points are handled (4-bit, uint8-packed).
++  ORT_UNUSED_PARAMETER(has_zero_points);
++  return nbits == 4 && !has_weight_idx && !single_scale_weights && block_size % 32 == 0 &&
++         K % 32 == 0 && batch_count == 1 && M <= kQ4DecodeMaxRows;
++}
++
++namespace {
++// A matrix's weights, scales and zero points (or null).
++struct Q4Matrix {
++  const Tensor* b;
++  const Tensor* scales;
++  const Tensor* zero_points;
++};
++
++Status RunQ4Decode(const Tensor* a, const std::vector<Q4Matrix>& matrices, const Tensor* bias,
++                   uint32_t M, uint32_t N, uint32_t K, uint32_t block_size, onnxruntime::webgpu::ComputeContext& context,
++                   Tensor* y) {
++  const bool use_subgroups = context.HasFeature(wgpu::FeatureName::Subgroups) &&
++                             context.AdapterInfo().subgroupMinSize == 32 && context.AdapterInfo().subgroupMaxSize == 32;
++  const bool gated = matrices.size() == 2;
++  // One row of A: a row of W per team (more parallel work for the weight reads); more rows of A: each value of A
++  // loaded serves several rows of W (gate and up count as two).
++  const uint32_t rows_per_team = M == 1 ? 1 : (gated ? kQ4DecodeRowsPerTeam / 2 : kQ4DecodeRowsPerTeam);
++  const uint32_t row_groups = CeilDiv(N, kQ4DecodeTeams * rows_per_team);
++  const bool f16 = a->DataType() == DataTypeImpl::GetType<MLFloat16>();
++  const bool has_zero_points = matrices[0].zero_points != nullptr;
++  MatMulNBitsQ4DecodeProgram program{bias != nullptr, use_subgroups, M, rows_per_team, gated, f16, has_zero_points};
++  program.SetWorkgroupSize(kQ4DecodeTeams * 32);
++  program.SetDispatchGroupSize(row_groups);
++  program.AddInput({a, ProgramTensorMetadataDependency::TypeAndRank, 4});
++  for (const auto& [b, scales, zero_points] : matrices) {
++    program.AddInputs({{b, ProgramTensorMetadataDependency::TypeAndRank, 16},
++                       {scales, ProgramTensorMetadataDependency::TypeAndRank}});
++    if (has_zero_points) {
++      program.AddInput({zero_points, ProgramTensorMetadataDependency::None, {CeilDiv(zero_points->Shape().Size(), static_cast<int64_t>(4))}, 4});
++    }
++  }
++  if (bias != nullptr) {
++    program.AddInput({bias, ProgramTensorMetadataDependency::None});
++  }
++  program.AddOutput({y, ProgramTensorMetadataDependency::TypeAndRank});
++  // Zero points per row: the blocks rounded up to whole bytes (two per byte).
++  const uint32_t zero_blocks_per_col = CeilDiv(CeilDiv(K, block_size), 2u) * 2u;
++  program.AddUniformVariables({{N}, {K / 32}, {CeilDiv(K, block_size)}, {block_size / 32}, {zero_blocks_per_col}});
++  program.CacheHint(bias != nullptr, use_subgroups, M, rows_per_team, gated, f16, has_zero_points);
++  return context.RunProgram(program);
++}
++}  // namespace
++
++Status ApplyMatMulNBitsQ4Decode(const Tensor* a, const Tensor* b, const Tensor* scales, const Tensor* zero_points, const Tensor* bias,
++                                uint32_t M, uint32_t N, uint32_t K, uint32_t block_size,
++                                onnxruntime::webgpu::ComputeContext& context, Tensor* y) {
++  return RunQ4Decode(a, {{b, scales, zero_points}}, bias, M, N, K, block_size, context, y);
++}
++
++Status ApplyMatMulNBitsQ4DecodeGated(const Tensor* a, const Tensor* gate_b, const Tensor* gate_scales,
++                                     const Tensor* up_b, const Tensor* up_scales, uint32_t M, uint32_t N, uint32_t K,
++                                     uint32_t block_size, onnxruntime::webgpu::ComputeContext& context, Tensor* y) {
++  return RunQ4Decode(a, {{gate_b, gate_scales, nullptr}, {up_b, up_scales, nullptr}}, nullptr, M, N, K, block_size, context, y);
++}
++
++}  // namespace webgpu
++}  // namespace contrib
++}  // namespace onnxruntime
+diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_q4_decode.h b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_q4_decode.h
+new file mode 100644
+index 0000000..fd263ba
+--- /dev/null
++++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_q4_decode.h
+@@ -0,0 +1,59 @@
++// Copyright (c) Quick Inference contributors.
++// Licensed under the MIT License.
++// Quick Inference patch: a faster 4-bit MatMulNBits kernel for few rows of A (decoding).
++
++#pragma once
++
++#include "core/providers/webgpu/program.h"
++#include "core/providers/webgpu/compute_context.h"
++
++namespace onnxruntime {
++namespace contrib {
++namespace webgpu {
++
++using namespace onnxruntime::webgpu;
++
++// Each team of 32 lanes computes one output row for one row of A (decoding), or four output rows for up to 8 rows of
++// A (checking a few guessed tokens at once). A lane takes a step of 32 weights (four words) of each of its rows,
++// striding along K, and walks it a word at a time: codes go to f16 two per word operation (0x6400 | code is the f16
++// value 1024 + code, so one subtraction gives q - 8 exactly) and are scaled, each value of A loaded is used for all of
++// the lane's rows, and a step's products are summed in f16 (f32 for f32 models) into f32 totals, reduced with
++// subgroupAdd where subgroups are 32 lanes, else through workgroup memory. Four rows of A cost little more than one: the weights dominate.
++// With zero points (4-bit, one per block, packed eight to a word as MatMulNBits stores them), a step subtracts
++// 1024 + its block's zero point instead of 1032.
++class MatMulNBitsQ4DecodeProgram final : public Program<MatMulNBitsQ4DecodeProgram> {
++ public:
++  MatMulNBitsQ4DecodeProgram(bool has_bias, bool use_subgroups, uint32_t rows, uint32_t rows_per_team, bool gated, bool f16, bool has_zero_points)
++      : Program{"MatMulNBitsQ4Decode"}, has_bias_{has_bias}, use_subgroups_{use_subgroups}, rows_{rows}, rows_per_team_{rows_per_team}, gated_{gated}, f16_{f16}, has_zero_points_{has_zero_points} {}
++  Status GenerateShaderCode(ShaderHelper& sh) const override;
++  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES({"N", ProgramUniformVariableDataType::Uint32},
++                                          {"steps", ProgramUniformVariableDataType::Uint32},
++                                          {"blocks_per_col", ProgramUniformVariableDataType::Uint32},
++                                          {"steps_per_block", ProgramUniformVariableDataType::Uint32},
++                                          {"zero_blocks_per_col", ProgramUniformVariableDataType::Uint32});
++
++ private:
++  bool has_bias_;
++  bool use_subgroups_;
++  uint32_t rows_;           // rows of A
++  uint32_t rows_per_team_;  // rows of W per team of 32 lanes (of each of gate and up when gated)
++  bool gated_;              // silu(A x gate) * (A x up): a gated MLP's first half
++  bool f16_;                // f16 activations (f32 ones are multiplied in f32)
++  bool has_zero_points_;    // 4-bit zero points per block (else 8)
++};
++
++bool CanApplyMatMulNBitsQ4Decode(uint32_t nbits, bool has_zero_points, bool has_weight_idx, bool single_scale_weights,
++                                 uint32_t block_size, uint32_t K, uint32_t batch_count, uint32_t M);
++
++Status ApplyMatMulNBitsQ4Decode(const Tensor* a, const Tensor* b, const Tensor* scales, const Tensor* zero_points, const Tensor* bias,
++                                uint32_t M, uint32_t N, uint32_t K, uint32_t block_size,
++                                onnxruntime::webgpu::ComputeContext& context, Tensor* y);
++
++// silu(a x gate) * (a x up), for MatMulNBitsMlp: same conditions as above, no biases.
++Status ApplyMatMulNBitsQ4DecodeGated(const Tensor* a, const Tensor* gate_b, const Tensor* gate_scales,
++                                     const Tensor* up_b, const Tensor* up_scales, uint32_t M, uint32_t N, uint32_t K,
++                                     uint32_t block_size, onnxruntime::webgpu::ComputeContext& context, Tensor* y);
++
++}  // namespace webgpu
++}  // namespace contrib
++}  // namespace onnxruntime
+diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_qkv.wgsl.template b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_qkv.wgsl.template
+index 60f34e9..0906e88 100644
+--- a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_qkv.wgsl.template
++++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_qkv.wgsl.template
+@@ -20,6 +20,15 @@
+ #if has_norm
+ var<workgroup> sum_squared_shared : array<f32, workgroup_size_x>;
+ #endif
++// Quick Inference patch: the norm is applied in f32 (an attention sink's ~1.5e4 times a norm weight overflows f16 when the
++// compiler multiplies those first, as Metal does).
++#if component_a == 1
++alias a_f32_t = f32;
++#elif component_a == 2
++alias a_f32_t = vec2<f32>;
++#else
++alias a_f32_t = vec4<f32>;
++#endif
+ var<workgroup> tile_A : array<input_a_value_t, a_length_per_tile>;
+ var<workgroup> q_inter_results : array<array<q_output_element_t, tile_size_k_vec + 1>, tile_size>;
+ var<workgroup> k_inter_results : array<array<q_output_element_t, tile_size_k_vec + 1>, tile_size>;
+@@ -81,7 +90,7 @@ fn loadSHMA(batch: u32, b_global_base: u32, kidx: u32, col: u32, inv_std: f32) {
+       input_skip_bias_sum.setByOffset(input_offset, input_skip_bias_sum_value_t(merged_value));
+     }
+ #endif
+-    tile_A[col] = merged_value * input_a_value_t(input_a_element_t(inv_std)) * norm_scale.getByOffset(k_offset);
++    tile_A[col] = input_a_value_t(a_f32_t(merged_value) * inv_std * a_f32_t(norm_scale.getByOffset(k_offset)));
+ #else
+     // Layer norm has already been applied to `a` upstream; load the pre-normalized value directly.
+     _ = b_global_base;
 diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_wide_tile.wgsl.template b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_wide_tile.wgsl.template
-index 15e78e8..f8f6e87 100644
+index 15e78e8..7adb87c 100644
 --- a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_wide_tile.wgsl.template
 +++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_wide_tile.wgsl.template
 @@ -12,8 +12,9 @@
@@ -368,17 +1681,21 @@ index 15e78e8..f8f6e87 100644
  const KAVecSizeForBlock32 = 8u;
  
  const kTileM : u32 = tile_m;
-@@ -203,7 +204,8 @@ $MAIN {
+@@ -202,8 +203,11 @@ $MAIN {
+   let capped_sg_id = min(sg_id, subgroup_min_size - 1u);
  #endif
  
-   var results : array<output_element_t, kTileM>;
+-  var results : array<output_element_t, kTileM>;
 -  for (var block_idx = 0u; block_idx < uniforms.n_blocks_per_col; block_idx++) {
++  // Quick Inference patch: totals in f32 (each eight-product dot pair is still computed in the output type). Running
++  // sums along K in f16 overflow on models with large activations (an attention sink's ~1.5e4 in Qwen3 1.7B).
++  var results : array<f32, kTileM>;
 +  for (var k32 = 0u; k32 < uniforms.n_k32; k32++) {
 +    let block_idx = k32 / uniforms.k32_per_block;
      // Load `a` elements into workgroup memory, kTileM x KAVecSizeForBlock32 (block32),
      // stored as pairs of vecs along K. One pass covers workgroup_size_x / KAVecSizeForBlock32
      // rows, so loop when kTileM is wider than that.
-@@ -212,14 +214,14 @@ $MAIN {
+@@ -212,14 +216,14 @@ $MAIN {
        let a_col_idx = local_idx % KAVecSizeForBlock32;
        a_data_tile[a_col_idx / 2u][a_row_idx][a_col_idx % 2u] = load_a(batch,
                                                                        row + a_row_idx,
@@ -395,3 +1712,201 @@ index 15e78e8..f8f6e87 100644
  
      for (var b_idx = 0u; b_idx < KAVecSizeForBlock32 / 2u; b_idx++) {
        let b_dequantized = dequantize(b_data[b_idx], zero_point, scale);
+@@ -227,8 +231,8 @@ $MAIN {
+       // Adapter guarantees a subgroup wide enough to shuffle the full kTileM band at once.
+       let a = a_data_tile[b_idx][capped_sg_id];
+       for (var m_idx = 0u; m_idx < kTileM; m_idx++) {
+-        results[m_idx] += dot(subgroupShuffle(a[0], m_idx), b_dequantized[0]) +
+-                          dot(subgroupShuffle(a[1], m_idx), b_dequantized[1]);
++        results[m_idx] += f32(dot(subgroupShuffle(a[0], m_idx), b_dequantized[0]) +
++                              dot(subgroupShuffle(a[1], m_idx), b_dequantized[1]));
+       }
+ #elif subgroup_min_size > 0 && tile_m % subgroup_min_size == 0
+       // kTileM is wider than a single subgroup can shuffle, so it's split into
+@@ -237,15 +241,15 @@ $MAIN {
+         let m_offset = chunk * subgroup_min_size;
+         let a = a_data_tile[b_idx][capped_sg_id + m_offset];
+         for (var m_idx = 0u; m_idx < subgroup_min_size; m_idx++) {
+-          results[m_idx + m_offset] += dot(subgroupShuffle(a[0], m_idx), b_dequantized[0]) +
+-                                       dot(subgroupShuffle(a[1], m_idx), b_dequantized[1]);
++          results[m_idx + m_offset] += f32(dot(subgroupShuffle(a[0], m_idx), b_dequantized[0]) +
++                                           dot(subgroupShuffle(a[1], m_idx), b_dequantized[1]));
+         }
+       }
+ #else
+       // No guaranteed subgroup support wide enough for shuffles: read each row directly.
+       for (var m_idx = 0u; m_idx < kTileM; m_idx++) {
+         let a = a_data_tile[b_idx][m_idx];
+-        results[m_idx] += dot(a[0], b_dequantized[0]) + dot(a[1], b_dequantized[1]);
++        results[m_idx] += f32(dot(a[0], b_dequantized[0]) + dot(a[1], b_dequantized[1]));
+       }
+ #endif
+     }
+@@ -268,9 +272,9 @@ $MAIN {
+   #endif
+   for (var m_idx = 0u; m_idx < kTileM; m_idx++) {
+   #if has_bias
+-    write_output(batch, row + m_idx, col + local_idx, results[m_idx] + bias_value);
++    write_output(batch, row + m_idx, col + local_idx, output_element_t(results[m_idx]) + bias_value);
+   #else
+-    write_output(batch, row + m_idx, col + local_idx, results[m_idx]);
++    write_output(batch, row + m_idx, col + local_idx, output_element_t(results[m_idx]));
+   #endif
+   }
+ }  // MAIN
+diff --git a/onnxruntime/core/optimizer/graph_transformer_utils.cc b/onnxruntime/core/optimizer/graph_transformer_utils.cc
+index cc2c49d..cceb740 100644
+--- a/onnxruntime/core/optimizer/graph_transformer_utils.cc
++++ b/onnxruntime/core/optimizer/graph_transformer_utils.cc
+@@ -412,7 +412,12 @@ InlinedVector<std::unique_ptr<GraphTransformer>> GenerateTransformers(
+ 
+       transformers.emplace_back(std::make_unique<GeluFusion>(cpu_acl_cuda_dml_webgpu_eps, level));
+       transformers.emplace_back(std::make_unique<LayerNormFusion>(cpu_acl_cuda_dml_webgpu_eps, level));
+-      transformers.emplace_back(std::make_unique<SimplifiedLayerNormFusion>(cpu_cuda_eps));
++      // Quick Inference patch: WebGPU too. Unfused, a float16 RMSNorm squares the residual in float16 (Qwen2.5's ~5e3
++      // overflows to inf: all-zero logits); SimplifiedLayerNormalization computes it in float32.
++      const InlinedHashSet<std::string_view> cpu_cuda_webgpu_eps = {onnxruntime::kCpuExecutionProvider,
++                                                                    onnxruntime::kCudaExecutionProvider,
++                                                                    onnxruntime::kWebGpuExecutionProvider};
++      transformers.emplace_back(std::make_unique<SimplifiedLayerNormFusion>(cpu_cuda_webgpu_eps));
+       transformers.emplace_back(std::make_unique<AttentionFusion>(cpu_acl_cuda_dml_eps));
+       transformers.emplace_back(std::make_unique<EmbedLayerNormFusion>(cpu_acl_cuda_dml_eps));
+       transformers.emplace_back(std::make_unique<GatherSliceToSplitFusion>(cpu_cuda_eps));
+diff --git a/onnxruntime/core/providers/webgpu/buffer_manager.cc b/onnxruntime/core/providers/webgpu/buffer_manager.cc
+index 8b419cf..e2ef49c 100644
+--- a/onnxruntime/core/providers/webgpu/buffer_manager.cc
++++ b/onnxruntime/core/providers/webgpu/buffer_manager.cc
+@@ -527,6 +527,17 @@ void BufferManager::Upload(void* src, WGPUBuffer dst, size_t size) const {
+   context_.EndComputePass();
+   command_encoder.CopyBufferToBuffer(staging_buffer, 0, dst, 0, copy_size);
+   ORT_THROW_IF_ERROR(context_.Flush(*this));
++
++  // Quick Inference patch: a staging buffer's memory goes only once the GPU has copied from it, and loading a model
++  // uploads faster than that: without a wait the staging copies of most of the weights could pile up (a second
++  // copy of a big model for a moment, pushing other memory to swap). Wait for the queue every so often.
++  constexpr size_t kMaxUnwaitedUploadBytes = 256 * 1024 * 1024;
++  unwaited_upload_bytes_ += copy_size;
++  if (unwaited_upload_bytes_ >= kMaxUnwaitedUploadBytes) {
++    unwaited_upload_bytes_ = 0;
++    ORT_THROW_IF_ERROR(context_.Wait(context_.Device().GetQueue().OnSubmittedWorkDone(
++        wgpu::CallbackMode::WaitAnyOnly, [](wgpu::QueueWorkDoneStatus, wgpu::StringView) noexcept {})));
++  }
+ }
+ 
+ void BufferManager::MemCpy(WGPUBuffer src, WGPUBuffer dst, size_t size) const {
+@@ -545,6 +556,7 @@ void BufferManager::MemCpy(WGPUBuffer src, WGPUBuffer dst, size_t size) const {
+   auto& command_encoder = context_.GetCommandEncoder();
+   context_.EndComputePass();
+   command_encoder.CopyBufferToBuffer(src, 0, dst, 0, copy_size);
++  context_.RecordCapturedCopy(src, dst, copy_size);
+ }
+ 
+ WGPUBuffer BufferManager::Create(size_t size, wgpu::BufferUsage usage, bool initialize_to_zero,
+diff --git a/onnxruntime/core/providers/webgpu/buffer_manager.h b/onnxruntime/core/providers/webgpu/buffer_manager.h
+index bc291a0..5c942e1 100644
+--- a/onnxruntime/core/providers/webgpu/buffer_manager.h
++++ b/onnxruntime/core/providers/webgpu/buffer_manager.h
+@@ -111,6 +111,8 @@ class BufferManager {
+   std::unique_ptr<IBufferCacheManager> uniform_cache_;
+   std::unique_ptr<IBufferCacheManager> query_resolve_cache_;
+   std::unique_ptr<IBufferCacheManager> default_cache_;
++  // Quick Inference patch: bytes uploaded through staging buffers since the queue was last waited on (see Upload).
++  mutable size_t unwaited_upload_bytes_{0};
+ };
+ 
+ class BufferManagerFactory {
+diff --git a/onnxruntime/core/providers/webgpu/nn/layer_norm.cc b/onnxruntime/core/providers/webgpu/nn/layer_norm.cc
+index b303182..495e49e 100644
+--- a/onnxruntime/core/providers/webgpu/nn/layer_norm.cc
++++ b/onnxruntime/core/providers/webgpu/nn/layer_norm.cc
+@@ -40,7 +40,9 @@ Status LayerNormProgram::GenerateShaderCode(ShaderHelper& shader) const {
+   }
+ 
+   std::string simpl1 = (simplified_) ? "" : "- mean * mean ";
+-  std::string simpl2 = (simplified_) ? "" : "- x_element_t(mean) ";
++  std::string simpl2 = (simplified_) ? "" : "- mean ";
++  // Quick Inference patch: the output is computed in f32 (an attention sink's ~1.5e4 times a norm weight overflows f16 when
++  // the compiler multiplies those first, as Metal does).
+ 
+   if (split_norm_dim_) {
+     shader.AdditionalImplementation()
+@@ -78,7 +80,7 @@ Status LayerNormProgram::GenerateShaderCode(ShaderHelper& shader) const {
+         << "  let mean = sum_shared[0] / f32(uniforms.norm_size);\n"
+         << "  let inv_std_dev = inverseSqrt(sum_squared_shared[0] / f32(uniforms.norm_size) " << simpl1 << "+ uniforms.epsilon);\n"
+         << "  let offset = workgroup_idx * workgroup_size_x + local_idx;\n"
+-        << "  y[offset] = ((cur_input " << simpl2 << ") * x_element_t(inv_std_dev) * scale[offset]" << (has_bias_ ? " + bias[offset] " : "") << ");\n";
++        << "  y[offset] = x_value_t((vec4<f32>(cur_input) " << simpl2 << ") * inv_std_dev * vec4<f32>(scale[offset]))" << (has_bias_ ? " + bias[offset]" : "") << ";\n";
+ 
+     if (has_mean_output_) {
+       shader.MainFunctionBody() << "  if (local_idx == 0 && workgroup_idx == 0) {\n"
+@@ -133,7 +135,7 @@ Status LayerNormProgram::GenerateShaderCode(ShaderHelper& shader) const {
+         << "let mean = " << SumVector("sum", components) << " / f32(uniforms.norm_size);\n"
+         << "let inv_std_dev = inverseSqrt(" << SumVector("square_sum", components) << " / f32(uniforms.norm_size) " << simpl1 << "+ uniforms.epsilon);\n"
+         << "for (var i: u32 = 0; i < stride; i++) {\n"
+-        << " y[offset + i] = (y[offset + i] " << simpl2 << ") * x_element_t(inv_std_dev) * scale[offset1d + i]" << bias << ";\n"
++        << " y[offset + i] = x_value_t((f32_val_t(y[offset + i]) " << simpl2 << ") * inv_std_dev * f32_val_t(scale[offset1d + i]))" << bias << ";\n"
+         << "};\n";
+ 
+     if (has_mean_output_) {
+diff --git a/onnxruntime/core/providers/webgpu/webgpu_context.cc b/onnxruntime/core/providers/webgpu/webgpu_context.cc
+index ff85ff9..b070f2a 100644
+--- a/onnxruntime/core/providers/webgpu/webgpu_context.cc
++++ b/onnxruntime/core/providers/webgpu/webgpu_context.cc
+@@ -1142,6 +1142,12 @@ void WebGpuContext::Replay(const std::vector<webgpu::CapturedCommandInfo>& captu
+   for (size_t i = 0; i < command_count; ++i) {
+     auto& command = captured_commands[i];
+ 
++    if (command.copy_src != nullptr) {
++      EndComputePass();
++      GetCommandEncoder().CopyBufferToBuffer(command.copy_src, 0, command.copy_dst, 0, command.copy_size);
++      continue;
++    }
++
+     // Restore profiling info when profiling is enabled. All commands are expected
+     // to have profiling data in this mode to keep pending_kernels_ consistent
+     // with num_pending_dispatches_.
+@@ -1165,6 +1171,18 @@ void WebGpuContext::Replay(const std::vector<webgpu::CapturedCommandInfo>& captu
+   graph_capture_state_ = GraphCaptureState::Default;
+ }
+ 
++void WebGpuContext::RecordCapturedCopy(WGPUBuffer src, WGPUBuffer dst, uint64_t size) {
++  if (graph_capture_state_ != GraphCaptureState::Capturing) {
++    return;
++  }
++  ORT_ENFORCE(external_captured_commands_ != nullptr);
++  webgpu::CapturedCommandInfo copy{};
++  copy.copy_src = src;
++  copy.copy_dst = dst;
++  copy.copy_size = size;
++  external_captured_commands_->push_back(std::move(copy));
++}
++
+ void WebGpuContext::CaptureEnd() {
+   LOGS_DEFAULT(VERBOSE) << "CaptureEnd";
+ 
+diff --git a/onnxruntime/core/providers/webgpu/webgpu_context.h b/onnxruntime/core/providers/webgpu/webgpu_context.h
+index 1790c85..eb450d4 100644
+--- a/onnxruntime/core/providers/webgpu/webgpu_context.h
++++ b/onnxruntime/core/providers/webgpu/webgpu_context.h
+@@ -106,6 +106,12 @@ struct CapturedCommandInfo {
+   WGPUBuffer indirect_buffer = nullptr;
+   // Optional profiling data
+   std::optional<PendingKernelInfo> pending_kernel_info;
++  // Quick Inference patch: when copy_src is set, a GPU-to-GPU buffer copy instead of a dispatch (kernels that fill an
++  // output from an input with CopyTensor: Identity, ScatterElements, ...). Captured in order with the dispatches, so
++  // replays repeat it; before, a captured graph ran it only while being captured.
++  WGPUBuffer copy_src = nullptr;
++  WGPUBuffer copy_dst = nullptr;
++  uint64_t copy_size = 0;
+ };
+ 
+ struct WebGpuBufferCacheConfig {
+@@ -263,6 +269,8 @@ class WebGpuContext final {
+   void CaptureEnd();
+   void Replay(const std::vector<webgpu::CapturedCommandInfo>& captured_commands, const webgpu::BufferManager& buffer_manager);
+   void ReleaseGraphResources(std::vector<webgpu::CapturedCommandInfo>& captured_commands);
++  // Quick Inference patch: records a buffer copy encoded while capturing (see CapturedCommandInfo::copy_src).
++  void RecordCapturedCopy(WGPUBuffer src, WGPUBuffer dst, uint64_t size);
+ 
+   Status Flush(const webgpu::BufferManager& buffer_mgr);
+ 
