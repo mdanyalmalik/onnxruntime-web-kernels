@@ -989,6 +989,648 @@ index 027fc77..1e9857c 100644
  #else
      let a_row = a_global;
  #endif
+diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_ggml.cc b/onnxruntime/contrib_ops/webgpu/quantization/matmul_ggml.cc
+new file mode 100644
+index 0000000..9475948
+--- /dev/null
++++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_ggml.cc
+@@ -0,0 +1,522 @@
++// Copyright (c) Quick Inference contributors.
++// Licensed under the MIT License.
++// Quick Inference patch: see matmul_ggml.h.
++
++#include "contrib_ops/webgpu/quantization/matmul_ggml.h"
++
++#include <sstream>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "contrib_ops/webgpu/webgpu_contrib_kernels.h"
++#include "core/providers/cpu/math/matmul_helper.h"
++#include "core/providers/webgpu/shader_helper.h"
++#include "core/providers/webgpu/webgpu_supported_types.h"
++#include "core/providers/webgpu/webgpu_utils.h"
++
++namespace onnxruntime {
++namespace contrib {
++namespace webgpu {
++
++namespace {
++
++constexpr uint32_t kSuperblock = 256;
++constexpr uint32_t kDecodeTeams = 4;
++// Rows of W per team: one row of A gets more (its 32 values of a step stay in registers for all of them).
++uint32_t DecodeRowsPerTeam(uint32_t M) { return M == 1 ? 4 : 2; }
++constexpr uint32_t kTileN = 128;
++constexpr uint32_t kTileM = 64;
++
++struct Layout {
++  uint32_t record_words;
++  uint32_t aux_halves;
++  // Words of the type's grid input (0: no grid).
++  uint32_t grid_words;
++};
++
++Status GetLayout(GgmlType type, Layout* layout) {
++  switch (type) {
++    case GgmlType::Q3_K: *layout = {27, 1, 0}; break;
++    case GgmlType::Q4_K: *layout = {35, 2, 0}; break;
++    case GgmlType::Q5_K: *layout = {43, 2, 0}; break;
++    case GgmlType::Q6_K: *layout = {52, 1, 0}; break;
++    case GgmlType::IQ2_S: *layout = {20, 1, 4096}; break;
++    case GgmlType::IQ3_S: *layout = {27, 1, 1024}; break;
++    case GgmlType::IQ4_XS: *layout = {33, 2, 16}; break;
++    default:
++      return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "ggml type ", static_cast<int64_t>(type), " is not supported.");
++  }
++  return Status::OK();
++}
++
++uint32_t RowWords(const Layout& layout, uint32_t K) {
++  const uint32_t superblocks = K / kSuperblock;
++  return superblocks * layout.record_words + (superblocks * layout.aux_halves + 1) / 2;
++}
++
++// The WGSL of one type's sub-block of 32 weights: `pre` (statements reading the sub-block's codes and scales), each
++// vec4 part's unscaled values and the index of its scale in `scales`, and an offset subtracted from every weight
++// (K types' dmin * min).
++struct SubBlock {
++  std::string pre;
++  std::vector<std::string> scales;
++  std::vector<std::pair<std::string, uint32_t>> parts;
++  std::string offset;
++};
++
++SubBlock SubBlockCode(GgmlType type) {
++  SubBlock b;
++  std::ostringstream c;
++  auto part = [&](const std::string& value, uint32_t scale) { b.parts.emplace_back(value, scale); };
++  switch (type) {
++    case GgmlType::Q4_K:
++    case GgmlType::Q5_K: {
++      const bool q5 = type == GgmlType::Q5_K;
++      c << "  let dmin = ggml_half(aux + 1u);\n"
++        << "  var sc: u32;\n"
++        << "  var mn: u32;\n"
++        << "  if (j < 4u) {\n"
++        << "    sc = ggml_byte(rec, j) & 63u;\n"
++        << "    mn = ggml_byte(rec, j + 4u) & 63u;\n"
++        << "  } else {\n"
++        << "    sc = (ggml_byte(rec, j + 4u) & 15u) | ((ggml_byte(rec, j - 4u) >> 6u) << 4u);\n"
++        << "    mn = (ggml_byte(rec, j + 4u) >> 4u) | ((ggml_byte(rec, j) >> 6u) << 4u);\n"
++        << "  }\n"
++        << "  let scale = d * f32(sc);\n"
++        << "  let off = dmin * f32(mn);\n"
++        << "  let base = rec + 3u + j * " << (q5 ? 5 : 4) << "u;\n";
++      if (q5) c << "  let high = input_b[base + 4u];\n";
++      b.scales = {"scale"};
++      b.offset = "off";
++      for (uint32_t p = 0; p < 8; p++) {
++        part("vec4<f32>(bits4(input_b[base + " + std::to_string(p / 2) + "u], " + std::to_string(16 * (p % 2)) + "u)" +
++                 (q5 ? " | (bits1(high, " + std::to_string(4 * p) + "u) << vec4<u32>(4u))" : "") + ")",
++             0);
++      }
++      break;
++    }
++    case GgmlType::Q6_K:
++      c << "  let base = rec + j * 6u;\n"
++        << "  let scale0 = d * f32(bitcast<i32>(ggml_byte(rec + 48u, 2u * j) << 24u) >> 24u);\n"
++        << "  let scale1 = d * f32(bitcast<i32>(ggml_byte(rec + 48u, 2u * j + 1u) << 24u) >> 24u);\n";
++      b.scales = {"scale0", "scale1"};
++      for (uint32_t p = 0; p < 8; p++) {
++        part("(vec4<f32>(bits4(input_b[base + " + std::to_string(p / 2) + "u], " + std::to_string(16 * (p % 2)) +
++                 "u) | (bits2(input_b[base + " + std::to_string(4 + p / 4) + "u], " + std::to_string(8 * (p % 4)) +
++                 "u) << vec4<u32>(4u))) - vec4<f32>(32.0))",
++             p / 4);
++      }
++      break;
++    case GgmlType::Q3_K:
++      c << "  let base = rec + j * 3u;\n";
++      for (uint32_t h = 0; h < 2; h++) {
++        // Scale of 16-weight group g = 2j + h: low 4 bits from byte g % 8 (nibble g / 8), high 2 from byte 8 + g % 4.
++        c << "  let g" << h << " = 2u * j + " << h << "u;\n"
++          << "  let scale" << h << " = d * f32(i32(((ggml_byte(rec + 24u, g" << h << " % 8u) >> (4u * (g" << h << " / 8u))) & 15u) | "
++          << "(((ggml_byte(rec + 24u, 8u + g" << h << " % 4u) >> (2u * (g" << h << " / 4u))) & 3u) << 4u)) - 32);\n";
++      }
++      c << "  let high = input_b[base + 2u];\n";
++      b.scales = {"scale0", "scale1"};
++      for (uint32_t p = 0; p < 8; p++) {
++        part("(vec4<f32>(bits2(input_b[base + " + std::to_string(p / 4) + "u], " + std::to_string(8 * (p % 4)) +
++                 "u) | (bits1(high, " + std::to_string(4 * p) + "u) << vec4<u32>(2u))) - vec4<f32>(4.0))",
++             p / 4);
++      }
++      break;
++    case GgmlType::IQ4_XS:
++      c << "  let low = (ggml_byte(rec, j / 2u) >> (4u * (j % 2u))) & 15u;\n"
++        << "  let high = (ggml_half_bits(aux + 1u) >> (2u * j)) & 3u;\n"
++        << "  let scale = d * f32(i32(low | (high << 4u)) - 32);\n"
++        << "  let base = rec + 1u + j * 4u;\n";
++      b.scales = {"scale"};
++      for (uint32_t p = 0; p < 8; p++) {
++        const std::string q = "q" + std::to_string(p);
++        c << "  let " << q << " = bits4(input_b[base + " << p / 2 << "u], " << 16 * (p % 2) << "u);\n";
++        part("bitcast<vec4<f32>>(vec4<u32>(grid[" + q + ".x], grid[" + q + ".y], grid[" + q + ".z], grid[" + q + ".w]))", 0);
++      }
++      break;
++    case GgmlType::IQ2_S:
++      // 8-weight vectors: index qs | 2 bits of qh << 8, one sign bit per weight; scales per 16 weights.
++      c << "  let qs = input_b[rec + 2u * j];\n"
++        << "  let signs = input_b[rec + 2u * j + 1u];\n"
++        << "  let qh = ggml_byte(rec + 16u, j);\n"
++        << "  let sc = ggml_byte(rec + 18u, j);\n"
++        << "  let scale0 = d * (0.5 + f32(sc & 15u)) * 0.25;\n"
++        << "  let scale1 = d * (0.5 + f32(sc >> 4u)) * 0.25;\n";
++      b.scales = {"scale0", "scale1"};
++      for (uint32_t g = 0; g < 4; g++) {
++        const std::string code = "code" + std::to_string(g);
++        c << "  let " << code << " = grid[((qs >> " << 8 * g << "u) & 255u) | (((qh >> " << 2 * g << "u) & 3u) << 8u)];\n";
++        const std::string sign = "(signs >> " + std::to_string(8 * g) + "u)";
++        part("signed(iq2s(" + code + ", 0u), " + sign + ")", g / 2);
++        part("signed(iq2s(" + code + ", 1u), " + sign + " >> 4u)", g / 2);
++      }
++      break;
++    case GgmlType::IQ3_S:
++      // 4-weight vectors: index qs | 1 bit of qh << 8, one sign bit per weight; one scale per sub-block.
++      c << "  let base = rec + 3u * j;\n"
++        << "  let qs0 = input_b[base];\n"
++        << "  let qs1 = input_b[base + 1u];\n"
++        << "  let signs = input_b[base + 2u];\n"
++        << "  let qh = ggml_byte(rec + 24u, j);\n"
++        << "  let scale = d * f32(1u + 2u * ((ggml_byte(rec + 26u, j / 2u) >> (4u * (j % 2u))) & 15u));\n";
++      b.scales = {"scale"};
++      for (uint32_t p = 0; p < 8; p++) {
++        part("signed(iq3s(grid[((qs" + std::to_string(p / 4) + " >> " + std::to_string(8 * (p % 4)) + "u) & 255u) | (((qh >> " +
++                 std::to_string(p) + "u) & 1u) << 8u)]), signs >> " + std::to_string(4 * p) + "u)",
++             0);
++      }
++      break;
++  }
++  b.pre = c.str();
++  return b;
++}
++
++// WGSL for ggml_sub(row, s), the 32 weights of sub-block s of row `row` as 8 vec4 (weights 4p..4p+3 in element p),
++// and ggml_dot(row, s, x), their dot product with x's 32 values, each scale applied once to its part of the sum. Reads
++// `input_b` (the layout, as u32) and, for IQ types, `grid` (IQ2_S's and IQ3_S's vectors of magnitudes as float16,
++// IQ4_XS's 16 values as float32 bits).
++std::string SubBlockFunctions(GgmlType type) {
++  Layout layout;
++  ORT_THROW_IF_ERROR(GetLayout(type, &layout));
++  const SubBlock b = SubBlockCode(type);
++  std::ostringstream c;
++  c << "fn ggml_half(h: u32) -> f32 { return unpack2x16float(input_b[h >> 1u])[h & 1u]; }\n"
++    << "fn ggml_half_bits(h: u32) -> u32 { return (input_b[h >> 1u] >> ((h & 1u) * 16u)) & 0xffffu; }\n"
++    << "fn ggml_byte(w: u32, b: u32) -> u32 { return (input_b[w + (b >> 2u)] >> ((b & 3u) * 8u)) & 0xffu; }\n"
++    << "fn bits4(word: u32, shift: u32) -> vec4<u32> { return (vec4<u32>(word) >> (vec4<u32>(0u, 4u, 8u, 12u) + vec4<u32>(shift))) & vec4<u32>(15u); }\n"
++    << "fn bits2(word: u32, shift: u32) -> vec4<u32> { return (vec4<u32>(word) >> (vec4<u32>(0u, 2u, 4u, 6u) + vec4<u32>(shift))) & vec4<u32>(3u); }\n"
++    << "fn bits1(word: u32, shift: u32) -> vec4<u32> { return (vec4<u32>(word) >> (vec4<u32>(0u, 1u, 2u, 3u) + vec4<u32>(shift))) & vec4<u32>(1u); }\n"
++    // Bit i of `bits` (i = 0..3) becomes the sign of element i: moved to bit 31 and XOR-ed into the float.
++    // IQ2_S's grid entry: 8 float16 magnitudes in a vec4<u32>; `second` (0 or 1) picks 4 of them.
++    << "fn iq2s(v: vec4<u32>, second: u32) -> vec4<f32> { return vec4<f32>(unpack2x16float(v[2u * second]), unpack2x16float(v[2u * second + 1u])); }\n"
++    << "fn iq3s(v: vec2<u32>) -> vec4<f32> { return vec4<f32>(unpack2x16float(v.x), unpack2x16float(v.y)); }\n"
++    << "fn signed(m: vec4<f32>, bits: u32) -> vec4<f32> {\n"
++    << "  return bitcast<vec4<f32>>(bitcast<vec4<u32>>(m) ^ ((vec4<u32>(bits) << vec4<u32>(31u, 30u, 29u, 28u)) & vec4<u32>(0x80000000u)));\n"
++    << "}\n";
++  const std::string prologue =
++      "  let sb = s / 8u;\n"
++      "  let j = s % 8u;\n"
++      "  let rec = row * uniforms.row_words + sb * " + std::to_string(layout.record_words) + "u;\n"
++      "  let aux = (row * uniforms.row_words + uniforms.superblocks * " + std::to_string(layout.record_words) + "u) * 2u + sb * " +
++      std::to_string(layout.aux_halves) + "u;\n" +
++      "  let d = ggml_half(aux);\n";
++  c << "fn ggml_sub(row: u32, s: u32) -> array<vec4<f32>, 8> {\n"
++    << prologue << b.pre << "  var w: array<vec4<f32>, 8>;\n";
++  for (size_t p = 0; p < b.parts.size(); p++) {
++    c << "  w[" << p << "] = " << b.scales[b.parts[p].second] << " * " << b.parts[p].first;
++    if (!b.offset.empty()) c << " - vec4<f32>(" << b.offset << ")";
++    c << ";\n";
++  }
++  c << "  return w;\n"
++    << "}\n";
++  c << "fn ggml_dot(row: u32, s: u32, x: ptr<function, array<vec4<f32>, 8>>) -> f32 {\n"
++    << prologue << b.pre << "  var total = 0.0;\n";
++  for (size_t k = 0; k < b.scales.size(); k++) {
++    c << "  total += " << b.scales[k] << " * (";
++    bool first = true;
++    for (size_t p = 0; p < b.parts.size(); p++) {
++      if (b.parts[p].second != k) continue;
++      c << (first ? "" : " + ") << "dot((*x)[" << p << "], " << b.parts[p].first << ")";
++      first = false;
++    }
++    c << ");\n";
++  }
++  if (!b.offset.empty()) {
++    c << "  total -= " << b.offset << " * (";
++    for (size_t p = 0; p < b.parts.size(); p++) c << (p ? " + " : "") << "dot((*x)[" << p << "], vec4<f32>(1.0))";
++    c << ");\n";
++  }
++  c << "  return total;\n"
++    << "}\n";
++  return c.str();
++}
++
++// With `shared_grid`, the grid is copied into workgroup memory (`grid`; the input is `grid_in`), where its random
++// lookups are cheaper than from a storage buffer; the program's main function calls load_grid first.
++void AddWeightInputs(ShaderHelper& shader, GgmlType type, bool shared_grid = false) {
++  Layout layout;
++  ORT_THROW_IF_ERROR(GetLayout(type, &layout));
++  shader.AddInput("input_b");
++  // IQ2_S's and IQ3_S's grids (float16 magnitudes) stay in their storage buffers.
++  const bool copy = shared_grid && layout.grid_words && type != GgmlType::IQ2_S && type != GgmlType::IQ3_S;
++  if (layout.grid_words) {
++    shader.AddInput(copy ? "grid_in" : "grid");
++  }
++  if (shared_grid) {
++    shader.AdditionalImplementation() << "fn load_grid(local: u32, threads: u32) {\n";
++    if (copy) {
++      shader.AdditionalImplementation()
++          << "  for (var i = local; i < " << layout.grid_words << "u; i += threads) { grid[i] = grid_in[i]; }\n"
++          << "  workgroupBarrier();\n";
++    }
++    shader.AdditionalImplementation() << "}\n";
++  }
++  if (copy) {
++    shader.AdditionalImplementation() << "var<workgroup> grid: array<u32, " << layout.grid_words << ">;\n";
++  }
++  shader.AdditionalImplementation() << SubBlockFunctions(type);
++}
++
++Status ReadType(const OpKernelInfo& info, GgmlType* type) {
++  *type = static_cast<GgmlType>(info.GetAttr<int64_t>("ggml_type"));
++  Layout layout;
++  return GetLayout(*type, &layout);
++}
++
++}  // namespace
++
++Status MatMulGgmlDecodeProgram::GenerateShaderCode(ShaderHelper& shader) const {
++  shader.AddInput("input_a", ShaderUsage::UseValueTypeAlias);
++  AddWeightInputs(shader, type_, true);
++  shader.AddOutput("output", ShaderUsage::UseElementTypeAlias);
++  shader.AdditionalImplementation() << "const M: u32 = " << rows_ << "u;\n";
++  if (!use_subgroups_) {
++    shader.AdditionalImplementation() << "var<workgroup> partial: array<f32, " << kDecodeTeams * 32 << ">;\n";
++  }
++  auto& body = shader.MainFunctionBody();
++  const uint32_t R = DecodeRowsPerTeam(rows_);
++  body << "  load_grid(local_idx, " << kDecodeTeams * 32 << "u);\n"
++       << "  let team = local_idx / 32u;\n"
++       << "  let lane = local_idx % 32u;\n"
++       << "  let first = (workgroup_idx * " << kDecodeTeams << "u + team) * " << R << "u;\n";
++  for (uint32_t r = 0; r < R; r++) body << "  var acc" << r << ": array<f32, M>;\n";
++  body << "  for (var s = lane; s < uniforms.steps; s += 32u) {\n";
++  if (rows_ == 1) {
++    // One row of A: its 32 values in registers, each row's weights summed into the product as they are decoded.
++    body << "    var x: array<vec4<f32>, 8>;\n";
++    for (uint32_t p = 0; p < 8; p++) body << "    x[" << p << "] = vec4<f32>(input_a[s * 8u + " << p << "u]);\n";
++    for (uint32_t r = 0; r < R; r++) {
++      body << "    acc" << r << "[0] += ggml_dot(min(first + " << r << "u, uniforms.N - 1u), s, &x);\n";
++    }
++  } else {
++    for (uint32_t r = 0; r < R; r++) {
++      body << "    let w" << r << " = ggml_sub(min(first + " << r << "u, uniforms.N - 1u), s);\n";
++    }
++    body << "    for (var m = 0u; m < M; m++) {\n"
++         << "      let i = (m * uniforms.steps + s) * 8u;\n";
++    for (uint32_t p = 0; p < 8; p++) body << "      let x" << p << " = vec4<f32>(input_a[i + " << p << "u]);\n";
++    for (uint32_t r = 0; r < R; r++) {
++      body << "      acc" << r << "[m] += ";
++      for (uint32_t p = 0; p < 8; p++) body << (p ? " + " : "") << "dot(x" << p << ", w" << r << "[" << p << "])";
++      body << ";\n";
++    }
++    body << "    }\n";
++  }
++  body << "  }\n";
++  for (uint32_t r = 0; r < R; r++) {
++    body << "  {\n"
++         << "    let row = first + " << r << "u;\n"
++         << "    for (var m = 0u; m < M; m++) {\n";
++    if (use_subgroups_) {
++      // Subgroups of exactly 32 lanes (checked on the host): a team is a subgroup.
++      body << "      let total = subgroupAdd(acc" << r << "[m]);\n";
++    } else {
++      body << "      partial[local_idx] = acc" << r << "[m];\n"
++           << "      workgroupBarrier();\n"
++           << "      for (var stride = 16u; stride > 0u; stride = stride / 2u) {\n"
++           << "        if (lane < stride) { partial[local_idx] += partial[local_idx + stride]; }\n"
++           << "        workgroupBarrier();\n"
++           << "      }\n"
++           << "      let total = partial[local_idx - lane];\n"
++           << "      workgroupBarrier();\n";
++    }
++    body << "      if (lane == 0u && row < uniforms.N) { output[m * uniforms.N + row] = output_element_t(total); }\n"
++         << "    }\n"
++         << "  }\n";
++  }
++  return Status::OK();
++}
++
++Status MatMulGgmlTileProgram::GenerateShaderCode(ShaderHelper& shader) const {
++  shader.AddInput("input_a", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseElementTypeAlias);
++  AddWeightInputs(shader, type_);
++  shader.AddOutput("output", ShaderUsage::UseElementTypeAlias);
++  // One sub-block of 32 weights of K per step. Tiles by vec4 along K, in A's type: tile_w[p * 128 + n],
++  // tile_a[p * 64 + m] (adjacent lanes read adjacent elements).
++  shader.AdditionalImplementation()
++      << "var<workgroup> tile_w: array<vec4<input_a_element_t>, " << kTileN * 8 << ">;\n"
++      << "var<workgroup> tile_a: array<vec4<input_a_element_t>, " << kTileM * 8 << ">;\n";
++  auto& body = shader.MainFunctionBody();
++  // 256 lanes: the first 128 decode a row's sub-block of W each, the rest load A; then each lane sums 8 x 4 outputs:
++  // rows of W n0 + 16i, rows of A m0 + 16j (float32 sums).
++  body << "  let tile_n = (workgroup_idx % uniforms.n_tiles) * " << kTileN << "u;\n"
++       << "  let tile_m = (workgroup_idx / uniforms.n_tiles) * " << kTileM << "u;\n"
++       << "  let n0 = local_idx % 16u;\n"
++       << "  let m0 = local_idx / 16u;\n"
++       << "  var acc: array<vec4<f32>, 8>;\n"
++       << "  for (var s = 0u; s < uniforms.steps; s++) {\n"
++       << "    if (local_idx < " << kTileN << "u) {\n"
++       << "      let w = ggml_sub(min(tile_n + local_idx, uniforms.N - 1u), s);\n";
++  for (uint32_t p = 0; p < 8; p++) {
++    body << "      tile_w[" << p * kTileN << "u + local_idx] = vec4<input_a_element_t>(w[" << p << "]);\n";
++  }
++  body << "    } else {\n"
++       << "      for (var e = local_idx - " << kTileN << "u; e < " << kTileM * 8 << "u; e += " << 256 - kTileN << "u) {\n"
++       << "        let p = e % 8u;\n"
++       << "        let m = e / 8u;\n"
++       << "        let gm = tile_m + m;\n"
++       << "        let a = input_a[(min(gm, uniforms.M - 1u) * uniforms.steps + s) * 8u + p];\n"
++       << "        tile_a[p * " << kTileM << "u + m] = select(input_a_value_t(0.0), a, gm < uniforms.M);\n"
++       << "      }\n"
++       << "    }\n"
++       << "    workgroupBarrier();\n"
++       << "    for (var p = 0u; p < 8u; p++) {\n";
++  for (uint32_t j = 0; j < 4; j++) body << "      let a" << j << " = vec4<f32>(tile_a[p * " << kTileM << "u + m0 + " << 16 * j << "u]);\n";
++  for (uint32_t i = 0; i < 8; i++) {
++    body << "      { let w = vec4<f32>(tile_w[p * " << kTileN << "u + n0 + " << 16 * i << "u]);\n"
++         << "        acc[" << i << "] += vec4<f32>(dot(a0, w), dot(a1, w), dot(a2, w), dot(a3, w)); }\n";
++  }
++  body << "    }\n"
++       << "    workgroupBarrier();\n"
++       << "  }\n";
++  for (uint32_t i = 0; i < 8; i++) {
++    for (uint32_t j = 0; j < 4; j++) {
++      body << "  { let m = tile_m + m0 + " << 16 * j << "u; let n = tile_n + n0 + " << 16 * i << "u;\n"
++           << "    if (m < uniforms.M && n < uniforms.N) { output[m * uniforms.N + n] = output_element_t(acc[" << i << "][" << j << "]); } }\n";
++    }
++  }
++  return Status::OK();
++}
++
++Status GatherGgmlProgram::GenerateShaderCode(ShaderHelper& shader) const {
++  shader.AddInput("indices");
++  AddWeightInputs(shader, type_);
++  shader.AddOutput("output", ShaderUsage::UseValueTypeAlias);
++  shader.MainFunctionBody()
++      << shader.GuardAgainstOutOfBoundsWorkgroupSizes("uniforms.count")
++      << "  let token = global_idx / uniforms.steps;\n"
++      << "  let s = global_idx % uniforms.steps;\n"
++      << "  let row = u32(clamp(indices[token], 0, i32(uniforms.N) - 1));\n"
++      << "  let w = ggml_sub(row, s);\n";
++  for (uint32_t p = 0; p < 8; p++) {
++    shader.MainFunctionBody() << "  output[global_idx * 8u + " << p << "u] = output_value_t(w[" << p << "]);\n";
++  }
++  return Status::OK();
++}
++
++ONNX_OPERATOR_KERNEL_EX(
++    MatMulGgml,
++    kMSDomain,
++    1,
++    kWebGpuExecutionProvider,
++    (*KernelDefBuilder::Create())
++        .TypeConstraint("T1", WebGpuSupportedFloatTypes())
++        .TypeConstraint("T2", DataTypeImpl::GetTensorType<uint8_t>()),
++    MatMulGgml);
++
++ONNX_OPERATOR_KERNEL_EX(
++    GatherGgml,
++    kMSDomain,
++    1,
++    kWebGpuExecutionProvider,
++    (*KernelDefBuilder::Create())
++        .TypeConstraint("T1", DataTypeImpl::GetTensorType<MLFloat16>())
++        .TypeConstraint("T2", DataTypeImpl::GetTensorType<uint8_t>())
++        .TypeConstraint("Tind", DataTypeImpl::GetTensorType<int32_t>()),
++    GatherGgml);
++
++MatMulGgml::MatMulGgml(const OpKernelInfo& info) : WebGpuKernel(info) {
++  K_ = info.GetAttr<int64_t>("K");
++  N_ = info.GetAttr<int64_t>("N");
++  ORT_THROW_IF_ERROR(ReadType(info, &type_));
++  ORT_ENFORCE(K_ % kSuperblock == 0, "MatMulGgml: K must be a multiple of 256.");
++}
++
++Status MatMulGgml::ComputeInternal(onnxruntime::webgpu::ComputeContext& context) const {
++  const Tensor* a = context.Input(0);
++  const Tensor* b = context.Input(1);
++  const Tensor* grid = context.Input(2);
++  Layout layout;
++  ORT_RETURN_IF_ERROR(GetLayout(type_, &layout));
++  ORT_RETURN_IF(layout.grid_words && grid == nullptr, "MatMulGgml: this type needs its grid input.");
++  const uint32_t K = onnxruntime::narrow<uint32_t>(K_);
++  const uint32_t N = onnxruntime::narrow<uint32_t>(N_);
++  const uint32_t row_words = RowWords(layout, K);
++  ORT_RETURN_IF(b->Shape().Size() != static_cast<int64_t>(N) * row_words * 4, "MatMulGgml: B has ", b->Shape().Size(),
++                " bytes, expected ", static_cast<int64_t>(N) * row_words * 4);
++
++  MatMulComputeHelper helper;
++  ORT_RETURN_IF_ERROR(helper.Compute(a->Shape(), TensorShape({N_, K_}), false, true));
++  Tensor* y = context.Output(0, helper.OutputShape());
++  if (y->Shape().Size() == 0) {
++    return Status::OK();
++  }
++  const uint32_t M = onnxruntime::narrow<uint32_t>(a->Shape().SizeToDimension(a->Shape().NumDimensions() - 1));
++  const uint32_t superblocks = K / kSuperblock;
++
++  auto add_weights = [&](auto& program) {
++    program.AddInput({b, ProgramTensorMetadataDependency::TypeAndRank, 4});
++    if (layout.grid_words) {
++      program.AddInput({grid, ProgramTensorMetadataDependency::TypeAndRank, type_ == GgmlType::IQ2_S ? 16 : type_ == GgmlType::IQ3_S ? 8 : 4});
++    }
++  };
++  if (M <= kGgmlDecodeMaxRows) {
++    const bool use_subgroups = context.HasFeature(wgpu::FeatureName::Subgroups) &&
++                               context.AdapterInfo().subgroupMinSize == 32 && context.AdapterInfo().subgroupMaxSize == 32;
++    MatMulGgmlDecodeProgram program{type_, M, use_subgroups};
++    program.SetWorkgroupSize(kDecodeTeams * 32);
++    program.SetDispatchGroupSize(CeilDiv(N, kDecodeTeams * DecodeRowsPerTeam(M)));
++    program.AddInput({a, ProgramTensorMetadataDependency::TypeAndRank, 4});
++    add_weights(program);
++    program.AddOutput({y, ProgramTensorMetadataDependency::TypeAndRank});
++    program.AddUniformVariables({{N}, {K / 32}, {row_words}, {superblocks}});
++    program.CacheHint(static_cast<int64_t>(type_), M, use_subgroups);
++    return context.RunProgram(program);
++  }
++  const uint32_t n_tiles = CeilDiv(N, kTileN);
++  MatMulGgmlTileProgram program{type_};
++  program.SetWorkgroupSize(256);
++  program.SetDispatchGroupSize(n_tiles * CeilDiv(M, kTileM));
++  program.AddInput({a, ProgramTensorMetadataDependency::TypeAndRank, 4});
++  add_weights(program);
++  program.AddOutput({y, ProgramTensorMetadataDependency::TypeAndRank});
++  program.AddUniformVariables({{M}, {N}, {K / 32}, {row_words}, {superblocks}, {n_tiles}});
++  program.CacheHint(static_cast<int64_t>(type_));
++  return context.RunProgram(program);
++}
++
++GatherGgml::GatherGgml(const OpKernelInfo& info) : WebGpuKernel(info) {
++  K_ = info.GetAttr<int64_t>("K");
++  ORT_THROW_IF_ERROR(ReadType(info, &type_));
++  ORT_ENFORCE(K_ % kSuperblock == 0, "GatherGgml: K must be a multiple of 256.");
++}
++
++Status GatherGgml::ComputeInternal(onnxruntime::webgpu::ComputeContext& context) const {
++  const Tensor* data = context.Input(0);
++  const Tensor* indices = context.Input(1);
++  const Tensor* grid = context.Input(2);
++  Layout layout;
++  ORT_RETURN_IF_ERROR(GetLayout(type_, &layout));
++  ORT_RETURN_IF(layout.grid_words && grid == nullptr, "GatherGgml: this type needs its grid input.");
++  const uint32_t K = onnxruntime::narrow<uint32_t>(K_);
++  const uint32_t row_words = RowWords(layout, K);
++  ORT_RETURN_IF(data->Shape().NumDimensions() != 2 || data->Shape()[1] != static_cast<int64_t>(row_words) * 4,
++                "GatherGgml: data must be [rows, ", row_words * 4, "] bytes.");
++  const uint32_t rows = onnxruntime::narrow<uint32_t>(data->Shape()[0]);
++
++  TensorShapeVector dims = indices->Shape().AsShapeVector();
++  dims.push_back(K_);
++  Tensor* y = context.Output(0, TensorShape(dims));
++  const uint32_t count = onnxruntime::narrow<uint32_t>(indices->Shape().Size()) * (K / 32);
++  if (count == 0) {
++    return Status::OK();
++  }
++  GatherGgmlProgram program{type_};
++  program.AddInput({indices, ProgramTensorMetadataDependency::TypeAndRank});
++  program.AddInput({data, ProgramTensorMetadataDependency::TypeAndRank, 4});
++  if (layout.grid_words) {
++    program.AddInput({grid, ProgramTensorMetadataDependency::TypeAndRank, type_ == GgmlType::IQ2_S ? 16 : type_ == GgmlType::IQ3_S ? 8 : 4});
++  }
++  program.AddOutput({y, ProgramTensorMetadataDependency::TypeAndRank, 4});
++  program.SetWorkgroupSize(64);
++  program.SetDispatchGroupSize(CeilDiv(count, 64u));
++  program.AddUniformVariables({{count}, {rows}, {K / 32}, {row_words}, {K / kSuperblock}});
++  program.CacheHint(static_cast<int64_t>(type_));
++  return context.RunProgram(program);
++}
++
++}  // namespace webgpu
++}  // namespace contrib
++}  // namespace onnxruntime
+diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_ggml.h b/onnxruntime/contrib_ops/webgpu/quantization/matmul_ggml.h
+new file mode 100644
+index 0000000..bf25ac7
+--- /dev/null
++++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_ggml.h
+@@ -0,0 +1,108 @@
++// Copyright (c) Quick Inference contributors.
++// Licensed under the MIT License.
++// Quick Inference patch: MatMulGgml and GatherGgml, matrices in llama.cpp's calibrated quantization types (IQ2_S,
++// IQ3_S, IQ4_XS, Q3_K, Q4_K, Q5_K, Q6_K) with their blocks re-laid out for word-aligned reads, unchanged otherwise.
++//
++// A row of K weights is K / 256 records of R words (one per superblock of 256 weights), then A float16 values per
++// superblock (its d, and dmin or IQ4_XS's high scale bits). Inside a record each sub-block of 32 weights has its codes
++// in words of its own, weight i at bit (i * bits) % 32 of word (i * bits) / 32; per-sub-block scales keep llama.cpp's
++// packing. tools/export/ggml_pack.py in Quick Inference writes the layout and decodes it as these shaders do.
++
++#pragma once
++
++#include "core/providers/webgpu/program.h"
++#include "core/providers/webgpu/webgpu_kernel.h"
++
++namespace onnxruntime {
++namespace contrib {
++namespace webgpu {
++
++using namespace onnxruntime::webgpu;
++
++// ggml's type ids.
++enum class GgmlType : int64_t {
++  Q3_K = 11,
++  Q4_K = 12,
++  Q5_K = 13,
++  Q6_K = 14,
++  IQ3_S = 21,
++  IQ2_S = 22,
++  IQ4_XS = 23,
++};
++
++// Rows of A up to which MatMulGgml uses its decode program (more go to the tiled one).
++constexpr uint32_t kGgmlDecodeMaxRows = 8;
++
++// Teams of 32 lanes take 2 rows of W each; every lane decodes one sub-block of 32 weights of both rows per step and
++// uses them for all M rows of A.
++class MatMulGgmlDecodeProgram final : public Program<MatMulGgmlDecodeProgram> {
++ public:
++  MatMulGgmlDecodeProgram(GgmlType type, uint32_t rows, bool use_subgroups)
++      : Program{"MatMulGgmlDecode"}, type_{type}, rows_{rows}, use_subgroups_{use_subgroups} {}
++  Status GenerateShaderCode(ShaderHelper& sh) const override;
++  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES({"N", ProgramUniformVariableDataType::Uint32},
++                                          {"steps", ProgramUniformVariableDataType::Uint32},
++                                          {"row_words", ProgramUniformVariableDataType::Uint32},
++                                          {"superblocks", ProgramUniformVariableDataType::Uint32});
++
++ private:
++  GgmlType type_;
++  uint32_t rows_;
++  bool use_subgroups_;
++};
++
++// Output tiles of 128 rows of W by 64 rows of A, 32 weights of K at a time through workgroup memory.
++class MatMulGgmlTileProgram final : public Program<MatMulGgmlTileProgram> {
++ public:
++  explicit MatMulGgmlTileProgram(GgmlType type) : Program{"MatMulGgmlTile"}, type_{type} {}
++  Status GenerateShaderCode(ShaderHelper& sh) const override;
++  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES({"M", ProgramUniformVariableDataType::Uint32},
++                                          {"N", ProgramUniformVariableDataType::Uint32},
++                                          {"steps", ProgramUniformVariableDataType::Uint32},
++                                          {"row_words", ProgramUniformVariableDataType::Uint32},
++                                          {"superblocks", ProgramUniformVariableDataType::Uint32},
++                                          {"n_tiles", ProgramUniformVariableDataType::Uint32});
++
++ private:
++  GgmlType type_;
++};
++
++// One invocation per sub-block of 32 weights of an output row.
++class GatherGgmlProgram final : public Program<GatherGgmlProgram> {
++ public:
++  explicit GatherGgmlProgram(GgmlType type) : Program{"GatherGgml"}, type_{type} {}
++  Status GenerateShaderCode(ShaderHelper& sh) const override;
++  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES({"count", ProgramUniformVariableDataType::Uint32},
++                                          {"N", ProgramUniformVariableDataType::Uint32},
++                                          {"steps", ProgramUniformVariableDataType::Uint32},
++                                          {"row_words", ProgramUniformVariableDataType::Uint32},
++                                          {"superblocks", ProgramUniformVariableDataType::Uint32});
++
++ private:
++  GgmlType type_;
++};
++
++class MatMulGgml final : public WebGpuKernel {
++ public:
++  MatMulGgml(const OpKernelInfo& info);
++  Status ComputeInternal(onnxruntime::webgpu::ComputeContext& context) const override;
++
++ private:
++  int64_t K_;
++  int64_t N_;
++  GgmlType type_;
++};
++
++class GatherGgml final : public WebGpuKernel {
++ public:
++  GatherGgml(const OpKernelInfo& info);
++  Status ComputeInternal(onnxruntime::webgpu::ComputeContext& context) const override;
++
++ private:
++  int64_t K_;
++  GgmlType type_;
++};
++
++}  // namespace webgpu
++}  // namespace contrib
++}  // namespace onnxruntime
 diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
 index 45baa67..62ded92 100644
 --- a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
@@ -1754,6 +2396,83 @@ index 15e78e8..7adb87c 100644
    #endif
    }
  }  // MAIN
+diff --git a/onnxruntime/contrib_ops/webgpu/webgpu_contrib_kernels.cc b/onnxruntime/contrib_ops/webgpu/webgpu_contrib_kernels.cc
+index d1d9c58..2bfe451 100644
+--- a/onnxruntime/contrib_ops/webgpu/webgpu_contrib_kernels.cc
++++ b/onnxruntime/contrib_ops/webgpu/webgpu_contrib_kernels.cc
+@@ -44,6 +44,8 @@ static const BuildKernelCreateInfoFn build_kernel_create_info_function_table[] =
+     BuildKernelCreateInfo<class ONNX_OPERATOR_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kMSDomain, 1, MatMulNBits)>,
+     BuildKernelCreateInfo<class ONNX_OPERATOR_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kMSDomain, 1, MatMulNBitsQkv)>,
+     BuildKernelCreateInfo<class ONNX_OPERATOR_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kMSDomain, 1, MatMulNBitsMlp)>,
++    BuildKernelCreateInfo<class ONNX_OPERATOR_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kMSDomain, 1, MatMulGgml)>,
++    BuildKernelCreateInfo<class ONNX_OPERATOR_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kMSDomain, 1, GatherGgml)>,
+     BuildKernelCreateInfo<class ONNX_OPERATOR_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kMSDomain, 1, MRotaryEmbedding)>,
+     BuildKernelCreateInfo<class ONNX_OPERATOR_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kMSDomain, 1, MultiHeadAttention)>,
+     BuildKernelCreateInfo<class ONNX_OPERATOR_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kMSDomain, 1, PagedAttention)>,
+diff --git a/onnxruntime/core/graph/contrib_ops/contrib_defs.cc b/onnxruntime/core/graph/contrib_ops/contrib_defs.cc
+index cc3f46b..6ced72b 100644
+--- a/onnxruntime/core/graph/contrib_ops/contrib_defs.cc
++++ b/onnxruntime/core/graph/contrib_ops/contrib_defs.cc
+@@ -3848,6 +3848,59 @@ For example, for 4 bits, the first 4 bits are stored in the lower 4 bits of a by
+         }
+       });
+ 
++  // Quick Inference patch: llama.cpp's quantization types (WebGPU only; see contrib_ops/webgpu/quantization/matmul_ggml.h).
++  static const char* MatMulGgml_ver1_doc = R"DOC(
++MatMulGgml computes A @ dequantize(B).T, where B ([N, K]) is in one of llama.cpp's quantization types (attribute
++ggml_type, ggml's type id: Q3_K 11, Q4_K 12, Q5_K 13, Q6_K 14, IQ3_S 21, IQ2_S 22, IQ4_XS 23) with its blocks re-laid
++out for word-aligned reads (see matmul_ggml.h). IQ types need their grid: IQ2_S's 1024 and IQ3_S's 512 vectors of
++magnitudes (float16), IQ4_XS's 16 values (float32).
++)DOC";
++
++  ONNX_CONTRIB_OPERATOR_SCHEMA(MatMulGgml)
++      .SetDomain(kMSDomain)
++      .SinceVersion(1)
++      .SetDoc(MatMulGgml_ver1_doc)
++      .Attr("K", "Input feature dimension of the weight matrix (a multiple of 256).", AttributeProto::INT)
++      .Attr("N", "Output feature dimension of the weight matrix.", AttributeProto::INT)
++      .Attr("ggml_type", "ggml's id of the weights' quantization type.", AttributeProto::INT)
++      .Input(0, "A", "The input tensor, not quantized.", "T1")
++      .Input(1, "B", "The weights, [N, row bytes].", "T2")
++      .Input(2, "grid", "The type's grid (IQ types).", "T2", OpSchema::Optional)
++      .Output(0, "Y", "The output tensor, [..., N].", "T1")
++      .TypeConstraint("T1", {"tensor(float)", "tensor(float16)"}, "Constrain input and output types to float tensors.")
++      .TypeConstraint("T2", {"tensor(uint8)"}, "Constrain weights to uint8.")
++      .TypeAndShapeInferenceFunction([](ONNX_NAMESPACE::InferenceContext& ctx) {
++        propagateElemTypeFromInputToOutput(ctx, 0, 0);
++        MatmulWithQuantWeightShapeInference(ctx, getAttribute(ctx, "K", -1), getAttribute(ctx, "N", -1), true);
++      });
++
++  static const char* GatherGgml_ver1_doc = R"DOC(
++GatherGgml looks rows of a matrix in one of llama.cpp's quantization types (as MatMulGgml's B) up by index and
++dequantizes them to float16: Y[..., :] = dequantize(data)[indices[...], :].
++)DOC";
++
++  ONNX_CONTRIB_OPERATOR_SCHEMA(GatherGgml)
++      .SetDomain(kMSDomain)
++      .SinceVersion(1)
++      .SetDoc(GatherGgml_ver1_doc)
++      .Attr("K", "Row length (a multiple of 256).", AttributeProto::INT)
++      .Attr("ggml_type", "ggml's id of the quantization type.", AttributeProto::INT)
++      .Input(0, "data", "The matrix, [rows, row bytes].", "T2")
++      .Input(1, "indices", "Row indices.", "Tind")
++      .Input(2, "grid", "The type's grid (IQ types).", "T2", OpSchema::Optional)
++      .Output(0, "Y", "The rows, indices' shape + [K].", "T1")
++      .TypeConstraint("T1", {"tensor(float16)"}, "Output type.")
++      .TypeConstraint("T2", {"tensor(uint8)"}, "Constrain data to uint8.")
++      .TypeConstraint("Tind", {"tensor(int32)"}, "Constrain indices to int32.")
++      .TypeAndShapeInferenceFunction([](ONNX_NAMESPACE::InferenceContext& ctx) {
++        updateOutputElemType(ctx, 0, ONNX_NAMESPACE::TensorProto::FLOAT16);
++        if (hasInputShape(ctx, 1)) {
++          ONNX_NAMESPACE::TensorShapeProto shape = getInputShape(ctx, 1);
++          shape.add_dim()->set_dim_value(getAttribute(ctx, "K", -1));
++          updateOutputShape(ctx, 0, shape);
++        }
++      });
++
+   static const char* MatMulNBitsMlp_ver1_doc = R"DOC(
+ MatMulNBitsMlp fuses two MatMulNBits projections that share the same input and computes
+ 
 diff --git a/onnxruntime/core/optimizer/graph_transformer_utils.cc b/onnxruntime/core/optimizer/graph_transformer_utils.cc
 index cc2c49d..cceb740 100644
 --- a/onnxruntime/core/optimizer/graph_transformer_utils.cc

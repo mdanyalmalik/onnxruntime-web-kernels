@@ -67,6 +67,18 @@ Each `.wasm` only works with the `.mjs` built with it, so load them as a pair (f
   and the RMSNorm fusion (SimplifiedLayerNormFusion) also runs for WebGPU, so a spelled-out RMSNorm doesn't square a
   float16 residual (Qwen2.5).
 
+- **llama.cpp's quantization types** (v1.30.0-qi.5). Two new operators, `com.microsoft.MatMulGgml` and
+  `com.microsoft.GatherGgml` (`contrib_ops/webgpu/quantization/matmul_ggml.{h,cc}`), read matrices in llama.cpp's
+  calibrated types (IQ2_S, IQ3_S, IQ4_XS, Q3_K, Q4_K, Q5_K, Q6_K) as they are: a GGUF's weights run without being
+  re-quantized. Each block of 256 weights is only re-laid out so that every 32-weight sub-block's codes sit in words of
+  their own (same size; Quick Inference's `tools/export/ggml_pack.py` writes it and checks it decodes to exactly
+  gguf-py's values). Decoding (1 to 8 rows of A): teams of 32 lanes, each lane one sub-block of 4 rows per step, the
+  weights summed into the dot product as they are decoded and each scale applied once to its part of the sum; IQ2_S's
+  and IQ3_S's grids are float16 magnitudes in a storage buffer (one load and `unpack2x16float` per 8 or 4 weights; signs
+  are XOR-ed into the float sign bit). Prompts: 128 x 64 output tiles through float16 workgroup memory with float32
+  sums. On a 7168 x 7168 IQ2_S matrix decoding reads about 62 GB/s of weights; Nanbeige4.3 33B (bartowski's IQ2_M)
+  decodes about 30% faster in Quick Inference than llama.cpp's Metal backend runs the same GGUF on the same Mac.
+
 Everything else is ONNX Runtime 1.30.0 as released.
 
 ## Building
