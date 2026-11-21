@@ -79,6 +79,15 @@ Each `.wasm` only works with the `.mjs` built with it, so load them as a pair (f
   sums. On a 7168 x 7168 IQ2_S matrix decoding reads about 62 GB/s of weights; Nanbeige4.3 33B (bartowski's IQ2_M)
   decodes about 30% faster in Quick Inference than llama.cpp's Metal backend runs the same GGUF on the same Mac.
 
+- **Experts stored as small floats, and softcapped SwiGLU, in WebGPU QMoE** (v1.30.0-qi.6). QMoE's new `weight_format`
+  attribute reads expert weights as NVIDIA's NVFP4 and the OCP MX formats store them: `"e2m1"` (4-bit E2M1 codes,
+  values 0 to ±6, two per byte with the even weight in the low nibble) or `"e4m3"` (float8 E4M3), each block of
+  `block_size` weights times its float16 scale (`contrib_ops/webgpu/moe/qmoe_float_weights.{h,cc}`): an NVFP4 or MXFP8
+  checkpoint's experts run without being re-quantized. Decoding (1 to 8 rows, each row with its own expert): teams of 32
+  lanes per output column, a lane per block of K; prompts: 64 x 32 output tiles through workgroup memory, float32 sums.
+  `swiglu_gate_softcap` and `swiglu_up_softcap` give SwiGLU as `g * tanh(gate / g) * sigmoid(gate) * u * tanh(up / u)`.
+  Together they run Thinking Machines' Inkling 2 Mini from its official checkpoint in Quick Inference.
+
 Everything else is ONNX Runtime 1.30.0 as released.
 
 ## Building

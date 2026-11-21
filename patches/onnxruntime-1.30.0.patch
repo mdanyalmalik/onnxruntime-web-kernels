@@ -668,10 +668,21 @@ index 1de81d8..15b0f1e 100644
      }
  } // MAIN
 diff --git a/onnxruntime/contrib_ops/webgpu/moe/moe.h b/onnxruntime/contrib_ops/webgpu/moe/moe.h
-index 332aa39..f8e7d2e 100755
+index 332aa39..f1090e6 100755
 --- a/onnxruntime/contrib_ops/webgpu/moe/moe.h
 +++ b/onnxruntime/contrib_ops/webgpu/moe/moe.h
-@@ -46,6 +46,8 @@ class MoE : public WebGpuKernel {
+@@ -34,6 +34,10 @@ class MoE : public WebGpuKernel {
+     activation_beta_ = static_cast<float>(info.GetAttrOrDefault<float>("activation_beta", 1.0));
+     swiglu_fusion_ = static_cast<int>(info.GetAttrOrDefault<int64_t>("swiglu_fusion", 0));
+     swiglu_limit_ = info.GetAttrOrDefault<float>("swiglu_limit", std::numeric_limits<float>::infinity());
++    // Quick Inference patch: SwiGLU with softcaps, c * tanh(x / c) (Inkling 2's experts): with swiglu_gate_softcap g and
++    // swiglu_up_softcap u, g * tanh(gate / g) * sigmoid(gate) * u * tanh(up / u). 0 (the default) is plain SwiGLU.
++    swiglu_gate_softcap_ = info.GetAttrOrDefault<float>("swiglu_gate_softcap", 0.0f);
++    swiglu_up_softcap_ = info.GetAttrOrDefault<float>("swiglu_up_softcap", 0.0f);
+     k_ = static_cast<int>(info.GetAttrOrDefault<int64_t>("k", 4));
+     normalize_routing_weights_ = info.GetAttrOrDefault<int64_t>("normalize_routing_weights", 0) == 1;
+     use_sparse_mixer_ = info.GetAttrOrDefault<int64_t>("use_sparse_mixer", 0) == 1;
+@@ -46,6 +50,8 @@ class MoE : public WebGpuKernel {
        activation_type_ = MoEActivationType::Silu;
      } else if (activation_type == "identity") {
        activation_type_ = MoEActivationType::Identity;
@@ -680,6 +691,15 @@ index 332aa39..f8e7d2e 100755
      } else if (activation_type == "swiglu") {
        activation_type_ = MoEActivationType::SwiGLU;
      } else {
+@@ -66,6 +72,8 @@ class MoE : public WebGpuKernel {
+   MoEActivationType activation_type_;
+   int swiglu_fusion_;
+   float swiglu_limit_;
++  float swiglu_gate_softcap_;
++  float swiglu_up_softcap_;
+   float activation_alpha_;
+   float activation_beta_;
+ };
 diff --git a/onnxruntime/contrib_ops/webgpu/moe/moe_base.h b/onnxruntime/contrib_ops/webgpu/moe/moe_base.h
 index bab99fe..c24009f 100755
 --- a/onnxruntime/contrib_ops/webgpu/moe/moe_base.h
@@ -695,7 +715,7 @@ index bab99fe..c24009f 100755
  
  enum class MoEQuantType {
 diff --git a/onnxruntime/contrib_ops/webgpu/moe/qmoe.cc b/onnxruntime/contrib_ops/webgpu/moe/qmoe.cc
-index b2797db..b3b46fc 100755
+index b2797db..7660800 100755
 --- a/onnxruntime/contrib_ops/webgpu/moe/qmoe.cc
 +++ b/onnxruntime/contrib_ops/webgpu/moe/qmoe.cc
 @@ -19,7 +19,7 @@ using onnxruntime::webgpu::ComputeContext;
@@ -776,7 +796,15 @@ index b2797db..b3b46fc 100755
  class SwigLuProgram final : public Program<SwigLuProgram> {
   public:
    SwigLuProgram() : Program<SwigLuProgram>{"SwigLu"} {
-@@ -124,6 +144,43 @@ class SwigLuProgram final : public Program<SwigLuProgram> {
+@@ -119,11 +139,50 @@ class SwigLuProgram final : public Program<SwigLuProgram> {
+       {"cols", ProgramUniformVariableDataType::Uint32},
+       {"alpha", ProgramUniformVariableDataType::Float32},
+       {"beta", ProgramUniformVariableDataType::Float32},
+-      {"swiglu_limit", ProgramUniformVariableDataType::Float32});
++      {"swiglu_limit", ProgramUniformVariableDataType::Float32},
++      {"gate_softcap", ProgramUniformVariableDataType::Float32},
++      {"up_softcap", ProgramUniformVariableDataType::Float32});
+ 
   private:
  };
  
@@ -820,7 +848,7 @@ index b2797db..b3b46fc 100755
  class FusedFinalMix1TokenProgram final : public Program<FusedFinalMix1TokenProgram> {
   public:
    FusedFinalMix1TokenProgram() : Program<FusedFinalMix1TokenProgram>{"QmoeFusedFinalMix1Token"} {}
-@@ -138,7 +195,9 @@ class FusedFinalMix1TokenProgram final : public Program<FusedFinalMix1TokenProgr
+@@ -138,7 +197,9 @@ class FusedFinalMix1TokenProgram final : public Program<FusedFinalMix1TokenProgr
  
    WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
        {"hidden_size", ProgramUniformVariableDataType::Uint32},
@@ -831,7 +859,22 @@ index b2797db..b3b46fc 100755
  };
  
  class QMoEFinalMixProgram final : public Program<QMoEFinalMixProgram> {
-@@ -233,27 +292,31 @@ Status QMoE::ComputeInternal(ComputeContext& context) const {
+@@ -230,30 +291,46 @@ Status QMoE::ComputeInternal(ComputeContext& context) const {
+   const int64_t block_size_fc1 = (block_size_ != 0) ? block_size_ : K_fc1;
+   const int64_t block_size_fc2 = (block_size_ != 0) ? block_size_ : K_fc2;
+   Status status;
++  // Quick Inference patch: experts as small floats take their own programs (qmoe_float_weights.h).
++  auto apply_fc = [&](const Tensor* a, const Tensor* weights, const Tensor* scales, const Tensor* bias, int64_t K,
++                      int64_t N, int64_t block_size, Tensor* y, uint32_t weight_index, const Tensor* indirect,
++                      uint32_t override_M) -> Status {
++    if (weight_format_ == MoEWeightFormat::Int) {
++      return ApplyMatMulNBits(a, weights, scales, nullptr, bias, K, N, block_size, accuracy_level, expert_weight_bits_,
++                              context, y, weight_index, indirect, override_M);
++    }
++    ORT_RETURN_IF_NOT(bias == nullptr, "QMoE weight_format ", static_cast<int>(weight_format_), " takes no biases");
++    return ApplyMoEFloatMatMul(a, weights, scales, K, N, block_size, weight_format_, context, y, weight_index, indirect,
++                               override_M);
++  };
  
    Tensor* output_tensor = context.Output(0, input_shape);
  
@@ -868,17 +911,18 @@ index b2797db..b3b46fc 100755
          .SetDispatchGroupSize(num_tokens)
          .AddUniformVariables({num_tokens, num_experts})
          .CacheHint(k_, is_fp16 ? "fp16" : "fp32");
-@@ -261,15 +324,15 @@ Status QMoE::ComputeInternal(ComputeContext& context) const {
+@@ -261,15 +338,14 @@ Status QMoE::ComputeInternal(ComputeContext& context) const {
  
      // Step 2: Batched fc1 MatMulNBits with M=k, per-row expert selection.
      // A is (1, hidden_size) but dispatched with override_M=k; shader broadcasts A row 0.
 -    TensorShape fc1_output_shape({static_cast<int64_t>(k), fc1_output_size});
 +    TensorShape fc1_output_shape({static_cast<int64_t>(rows), fc1_output_size});
      Tensor fc1_outputs = context.CreateGPUTensor(dtype, fc1_output_shape);
-     status = ApplyMatMulNBits(hidden_state, fc1_experts_weights, fc1_scales, nullptr, fc1_experts_bias_optional,
-                               K_fc1, N_fc1, block_size_fc1, accuracy_level, expert_weight_bits_, context,
+-    status = ApplyMatMulNBits(hidden_state, fc1_experts_weights, fc1_scales, nullptr, fc1_experts_bias_optional,
+-                              K_fc1, N_fc1, block_size_fc1, accuracy_level, expert_weight_bits_, context,
 -                              &fc1_outputs, 0, &indirect_experts, /*override_M=*/k);
-+                              &fc1_outputs, 0, &indirect_experts, /*override_M=*/rows);
++    status = apply_fc(hidden_state, fc1_experts_weights, fc1_scales, fc1_experts_bias_optional, K_fc1, N_fc1,
++                      block_size_fc1, &fc1_outputs, 0, &indirect_experts, rows);
      ORT_RETURN_IF_ERROR(status);
  
      // Step 3: SwiGLU on all k rows at once
@@ -887,7 +931,7 @@ index b2797db..b3b46fc 100755
      Tensor fc1_activated = context.CreateGPUTensor(dtype, fc1_activated_shape);
      if (is_swiglu) {
        SwigLuProgram swiglu;
-@@ -277,20 +340,28 @@ Status QMoE::ComputeInternal(ComputeContext& context) const {
+@@ -277,24 +353,33 @@ Status QMoE::ComputeInternal(ComputeContext& context) const {
            .AddInputs({{&fc1_outputs, ProgramTensorMetadataDependency::Type, 2}})
            .AddOutput({&fc1_activated, ProgramTensorMetadataDependency::None})
            .SetWorkgroupSize(128)
@@ -898,7 +942,10 @@ index b2797db..b3b46fc 100755
                                  static_cast<uint32_t>(moe_params.inter_size),
                                  activation_alpha_,
                                  activation_beta_,
-                                 swiglu_limit_});
+-                                swiglu_limit_});
++                                swiglu_limit_,
++                                swiglu_gate_softcap_,
++                                swiglu_up_softcap_});
        ORT_RETURN_IF_ERROR(context.RunProgram(swiglu));
      } else {
 -      ORT_THROW("only swiglu is supported for WebGPU.");
@@ -918,9 +965,15 @@ index b2797db..b3b46fc 100755
 -    TensorShape fc2_output_shape({static_cast<int64_t>(k), N_fc2});
 +    TensorShape fc2_output_shape({static_cast<int64_t>(rows), N_fc2});
      Tensor fc2_outputs = context.CreateGPUTensor(dtype, fc2_output_shape);
-     status = ApplyMatMulNBits(&fc1_activated, fc2_experts_weights, fc2_scales, nullptr, fc2_experts_bias_optional,
-                               K_fc2, N_fc2, block_size_fc2, accuracy_level, expert_weight_bits_, context,
-@@ -307,8 +378,8 @@ Status QMoE::ComputeInternal(ComputeContext& context) const {
+-    status = ApplyMatMulNBits(&fc1_activated, fc2_experts_weights, fc2_scales, nullptr, fc2_experts_bias_optional,
+-                              K_fc2, N_fc2, block_size_fc2, accuracy_level, expert_weight_bits_, context,
+-                              &fc2_outputs, 0, &indirect_experts, /*override_M=*/0);
++    status = apply_fc(&fc1_activated, fc2_experts_weights, fc2_scales, fc2_experts_bias_optional, K_fc2, N_fc2,
++                      block_size_fc2, &fc2_outputs, 0, &indirect_experts, 0);
+     ORT_RETURN_IF_ERROR(status);
+ 
+     // Step 5: Fused FinalMix — accumulate all k expert results weighted by router_values
+@@ -307,8 +392,8 @@ Status QMoE::ComputeInternal(ComputeContext& context) const {
          .AddInputs({{&indirect_experts, ProgramTensorMetadataDependency::Type}})
          .AddOutput({output_tensor, ProgramTensorMetadataDependency::None})
          .SetWorkgroupSize(mix_wg_size)
@@ -931,7 +984,7 @@ index b2797db..b3b46fc 100755
      ORT_RETURN_IF_ERROR(context.RunProgram(final_mix));
  
      return Status::OK();
-@@ -345,13 +416,20 @@ Status QMoE::ComputeInternal(ComputeContext& context) const {
+@@ -345,13 +430,20 @@ Status QMoE::ComputeInternal(ComputeContext& context) const {
      //  token_idx is the global index into hidden_state
      Tensor gate_hidden = context.CreateGPUTensor(dtype_uint32, gate_hidden_shape);
  
@@ -954,8 +1007,26 @@ index b2797db..b3b46fc 100755
          .SetDispatchGroupSize(static_cast<uint32_t>(num_tokens))
          .AddUniformVariables({static_cast<uint32_t>(num_tokens), num_experts, static_cast<uint32_t>(token_offset)})
          .CacheHint(k_, is_fp16 ? "fp16" : "fp32");
-@@ -422,7 +500,15 @@ Status QMoE::ComputeInternal(ComputeContext& context) const {
-                                   swiglu_limit_});
+@@ -400,9 +492,8 @@ Status QMoE::ComputeInternal(ComputeContext& context) const {
+       //
+       // Step 3: matmul the hidden_state with fc1 (gate_up) of the selected experts
+       //
+-      status = ApplyMatMulNBits(&expert_hidden, fc1_experts_weights, fc1_scales, nullptr, fc1_experts_bias_optional,
+-                                K_fc1, N_fc1, block_size_fc1, accuracy_level, expert_weight_bits_, context,
+-                                &fc1_outputs, expert_idx);
++      status = apply_fc(&expert_hidden, fc1_experts_weights, fc1_scales, fc1_experts_bias_optional, K_fc1, N_fc1,
++                        block_size_fc1, &fc1_outputs, expert_idx, nullptr, 0);
+       ORT_RETURN_IF_ERROR(status);
+ 
+       //
+@@ -419,18 +510,27 @@ Status QMoE::ComputeInternal(ComputeContext& context) const {
+                                   static_cast<uint32_t>(moe_params.inter_size),
+                                   activation_alpha_,
+                                   activation_beta_,
+-                                  swiglu_limit_});
++                                  swiglu_limit_,
++                                swiglu_gate_softcap_,
++                                swiglu_up_softcap_});
          ORT_RETURN_IF_ERROR(context.RunProgram(swiglu));
        } else {
 -        ORT_THROW("only swiglu is supported for WebGPU.");
@@ -971,6 +1042,371 @@ index b2797db..b3b46fc 100755
        }
  
        //
+       // Step 5: multiply fc1_activated with fc2 (gate_down) of the selected experts
+       //
+-      status = ApplyMatMulNBits(&fc1_activated, fc2_experts_weights, fc2_scales, nullptr, fc2_experts_bias_optional,
+-                                K_fc2, N_fc2, block_size_fc2, accuracy_level, expert_weight_bits_, context,
+-                                &fc2_outputs, expert_idx);
++      status = apply_fc(&fc1_activated, fc2_experts_weights, fc2_scales, fc2_experts_bias_optional, K_fc2, N_fc2,
++                        block_size_fc2, &fc2_outputs, expert_idx, nullptr, 0);
+       ORT_RETURN_IF_ERROR(status);
+ 
+       //
+diff --git a/onnxruntime/contrib_ops/webgpu/moe/qmoe.h b/onnxruntime/contrib_ops/webgpu/moe/qmoe.h
+index 2b398e5..e340dc4 100755
+--- a/onnxruntime/contrib_ops/webgpu/moe/qmoe.h
++++ b/onnxruntime/contrib_ops/webgpu/moe/qmoe.h
+@@ -7,6 +7,7 @@
+ #include "core/providers/webgpu/webgpu_kernel.h"
+ #include "contrib_ops/webgpu/moe/moe_base.h"
+ #include "contrib_ops/webgpu/moe/moe.h"
++#include "contrib_ops/webgpu/moe/qmoe_float_weights.h"
+ #include "core/providers/webgpu/math/matmul.h"
+ 
+ namespace onnxruntime {
+@@ -23,6 +24,20 @@ class QMoE final : public MoE {
+     ORT_ENFORCE(expert_weight_bits_ == 8 || expert_weight_bits_ == 4,
+                 "expert_weight_bits must be 4 or 8, but got ", expert_weight_bits_);
+     block_size_ = static_cast<int>(info.GetAttrOrDefault<int64_t>("block_size", 0));
++    // Quick Inference patch: experts stored as small floats (see qmoe_float_weights.h).
++    const std::string format = info.GetAttrOrDefault<std::string>("weight_format", "int");
++    if (format == "int") {
++      weight_format_ = MoEWeightFormat::Int;
++    } else if (format == "e2m1") {
++      weight_format_ = MoEWeightFormat::E2M1;
++      ORT_ENFORCE(expert_weight_bits_ == 4, "weight_format e2m1 needs expert_weight_bits 4");
++    } else if (format == "e4m3") {
++      weight_format_ = MoEWeightFormat::E4M3;
++      ORT_ENFORCE(expert_weight_bits_ == 8, "weight_format e4m3 needs expert_weight_bits 8");
++    } else {
++      ORT_THROW("Unsupported QMoE weight_format: ", format);
++    }
++    ORT_ENFORCE(weight_format_ == MoEWeightFormat::Int || block_size_ > 0, "weight_format ", format, " needs block_size");
+   }
+ 
+   Status ComputeInternal(ComputeContext& context) const override;
+@@ -30,6 +45,7 @@ class QMoE final : public MoE {
+  private:
+   int64_t expert_weight_bits_;
+   int64_t block_size_;
++  MoEWeightFormat weight_format_;
+ };
+ 
+ }  // namespace webgpu
+diff --git a/onnxruntime/contrib_ops/webgpu/moe/qmoe_float_weights.cc b/onnxruntime/contrib_ops/webgpu/moe/qmoe_float_weights.cc
+new file mode 100644
+index 0000000..c3fad58
+--- /dev/null
++++ b/onnxruntime/contrib_ops/webgpu/moe/qmoe_float_weights.cc
+@@ -0,0 +1,206 @@
++// Copyright (c) Quick Inference contributors.
++// Licensed under the MIT License.
++
++#include "contrib_ops/webgpu/moe/qmoe_float_weights.h"
++
++#include "core/providers/cpu/math/matmul_helper.h"
++#include "core/providers/webgpu/shader_helper.h"
++#include "core/providers/webgpu/webgpu_utils.h"
++
++namespace onnxruntime {
++namespace contrib {
++namespace webgpu {
++
++namespace {
++
++constexpr uint32_t kDecodeTeams = 8;
++constexpr uint32_t kTileN = 64;
++constexpr uint32_t kTileM = 32;
++
++uint32_t Bits(MoEWeightFormat format) { return format == MoEWeightFormat::E2M1 ? 4u : 8u; }
++
++// WGSL decoding one word of codes (8 E2M1 codes or 4 E4M3 bytes) to float32 values.
++void AddDecoders(ShaderHelper& shader, MoEWeightFormat format) {
++  auto& impl = shader.AdditionalImplementation();
++  if (format == MoEWeightFormat::E2M1) {
++    impl << "const E2M1 = array<f32, 16>(0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,\n"
++         << "                            -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0);\n"
++         << "fn decode_word(word: u32) -> array<f32, 8> {\n"
++         << "  var table = E2M1;\n"
++         << "  var v: array<f32, 8>;\n"
++         << "  for (var i = 0u; i < 8u; i++) { v[i] = table[(word >> (4u * i)) & 0xfu]; }\n"
++         << "  return v;\n"
++         << "}\n";
++  } else {
++    // E4M3FN: exponent bias 7, subnormals at exponent 0 (m * 2^-9); 0x7f/0xff are NaN and never stored.
++    impl << "fn e4m3(b: u32) -> f32 {\n"
++         << "  let e = (b >> 3u) & 0xfu;\n"
++         << "  let m = f32(b & 7u);\n"
++         << "  let magnitude = select(ldexp(1.0 + m / 8.0, i32(e) - 7), m * 0.001953125, e == 0u);\n"
++         << "  return select(magnitude, -magnitude, (b & 0x80u) != 0u);\n"
++         << "}\n"
++         << "fn decode_word(word: u32) -> array<f32, 4> {\n"
++         << "  return array<f32, 4>(e4m3(word & 0xffu), e4m3((word >> 8u) & 0xffu), e4m3((word >> 16u) & 0xffu),\n"
++         << "                       e4m3(word >> 24u));\n"
++         << "}\n";
++  }
++}
++
++}  // namespace
++
++Status MoEFloatDecodeProgram::GenerateShaderCode(ShaderHelper& shader) const {
++  shader.AddInput("input_a", ShaderUsage::UseValueTypeAlias);
++  shader.AddInput("input_b");
++  shader.AddInput("scales", ShaderUsage::UseValueTypeAlias);
++  if (has_indirect_) shader.AddInput("weight_index_indirect");
++  shader.AddOutput("output", ShaderUsage::UseElementTypeAlias);
++  AddDecoders(shader, format_);
++  const uint32_t per_word = 32 / Bits(format_);
++  const uint32_t words = block_size_ / per_word;
++  shader.AdditionalImplementation() << "var<workgroup> partial: array<f32, " << kDecodeTeams * 32 << ">;\n";
++  auto& body = shader.MainFunctionBody();
++  body << "  let team = local_idx / 32u;\n"
++       << "  let lane = local_idx % 32u;\n"
++       << "  let n = workgroup_id.x * " << kDecodeTeams << "u + team;\n"
++       << "  let row = workgroup_id.y;\n"
++       << "  let row_a = row * uniforms.rows_a / uniforms.rows;\n";
++  if (has_indirect_) {
++    body << "  let expert = weight_index_indirect[row];\n";
++  } else {
++    body << "  let expert = uniforms.weight_index;\n";
++  }
++  body << "  let blocks = uniforms.K / " << block_size_ << "u;\n"
++       << "  let col = min(n, uniforms.N - 1u);\n"
++       << "  let word_base = (expert * uniforms.N + col) * blocks * " << words << "u;\n"
++       << "  let scale_base = (expert * uniforms.N + col) * blocks;\n"
++       << "  let a_base = row_a * uniforms.K;\n"
++       << "  var acc = 0.0;\n"
++       << "  for (var blk = lane; blk < blocks; blk += 32u) {\n"
++       << "    var sum = 0.0;\n"
++       << "    for (var w = 0u; w < " << words << "u; w++) {\n"
++       << "      let v = decode_word(input_b[word_base + blk * " << words << "u + w]);\n"
++       << "      let k = a_base + blk * " << block_size_ << "u + w * " << per_word << "u;\n"
++       << "      for (var i = 0u; i < " << per_word << "u; i++) { sum += f32(input_a[k + i]) * v[i]; }\n"
++       << "    }\n"
++       << "    acc += sum * f32(scales[scale_base + blk]);\n"
++       << "  }\n"
++       << "  partial[local_idx] = acc;\n"
++       << "  workgroupBarrier();\n"
++       << "  for (var stride = 16u; stride > 0u; stride = stride / 2u) {\n"
++       << "    if (lane < stride) { partial[local_idx] += partial[local_idx + stride]; }\n"
++       << "    workgroupBarrier();\n"
++       << "  }\n"
++       << "  if (lane == 0u && n < uniforms.N) { output[row * uniforms.N + n] = output_element_t(partial[local_idx]); }\n";
++  return Status::OK();
++}
++
++Status MoEFloatTileProgram::GenerateShaderCode(ShaderHelper& shader) const {
++  shader.AddInput("input_a", ShaderUsage::UseValueTypeAlias);
++  shader.AddInput("input_b");
++  shader.AddInput("scales", ShaderUsage::UseValueTypeAlias);
++  shader.AddOutput("output", ShaderUsage::UseElementTypeAlias);
++  AddDecoders(shader, format_);
++  const uint32_t per_word = 32 / Bits(format_);
++  // tile_w[n * 33 + k], tile_a[m * 33 + k]: K 32 at a time (padded rows against bank conflicts).
++  shader.AdditionalImplementation()
++      << "var<workgroup> tile_w: array<f32, " << kTileN * 33 << ">;\n"
++      << "var<workgroup> tile_a: array<f32, " << kTileM * 33 << ">;\n";
++  auto& body = shader.MainFunctionBody();
++  // 256 lanes. Loading: lane t decodes 8 weights of column t / 4 (part t % 4) and 4 values of A of row t / 8 (part t % 8).
++  // Summing: lane t has rows 2 * (t / 16) + {0, 1} and columns 4 * (t % 16) + {0..3} of the tile.
++  body << "  let tile_n = (workgroup_idx % uniforms.n_tiles) * " << kTileN << "u;\n"
++       << "  let tile_m = (workgroup_idx / uniforms.n_tiles) * " << kTileM << "u;\n"
++       << "  let blocks = uniforms.K / " << block_size_ << "u;\n"
++       << "  let words_per_row = uniforms.K / " << per_word << "u;\n"
++       << "  let load_n = local_idx / 4u;\n"
++       << "  let load_part = local_idx % 4u;\n"
++       << "  let load_col = min(tile_n + load_n, uniforms.N - 1u);\n"
++       << "  let w_row = (uniforms.weight_index * uniforms.N + load_col);\n"
++       << "  let a_m = local_idx / 8u;\n"
++       << "  let a_part = local_idx % 8u;\n"
++       << "  let a_row = min(tile_m + a_m, uniforms.M - 1u);\n"
++       << "  let sum_m = (local_idx / 16u) * 2u;\n"
++       << "  let sum_n = (local_idx % 16u) * 4u;\n"
++       << "  var acc: array<f32, 8>;\n"
++       << "  for (var k0 = 0u; k0 < uniforms.K; k0 += 32u) {\n"
++       << "    let k = k0 + load_part * 8u;\n"
++       << "    let scale = f32(scales[w_row * blocks + k / " << block_size_ << "u]);\n";
++  for (uint32_t w = 0; w < 8 / per_word; w++) {
++    body << "    {\n"
++         << "      let v = decode_word(input_b[w_row * words_per_row + k / " << per_word << "u + " << w << "u]);\n"
++         << "      for (var i = 0u; i < " << per_word << "u; i++) {\n"
++         << "        tile_w[load_n * 33u + load_part * 8u + " << w * per_word << "u + i] = v[i] * scale;\n"
++         << "      }\n"
++         << "    }\n";
++  }
++  body << "    for (var i = 0u; i < 4u; i++) {\n"
++       << "      tile_a[a_m * 33u + a_part * 4u + i] = f32(input_a[a_row * uniforms.K + k0 + a_part * 4u + i]);\n"
++       << "    }\n"
++       << "    workgroupBarrier();\n"
++       << "    for (var j = 0u; j < 32u; j++) {\n"
++       << "      let a0 = tile_a[sum_m * 33u + j];\n"
++       << "      let a1 = tile_a[(sum_m + 1u) * 33u + j];\n"
++       << "      for (var c = 0u; c < 4u; c++) {\n"
++       << "        let w = tile_w[(sum_n + c) * 33u + j];\n"
++       << "        acc[c] += a0 * w;\n"
++       << "        acc[4u + c] += a1 * w;\n"
++       << "      }\n"
++       << "    }\n"
++       << "    workgroupBarrier();\n"
++       << "  }\n"
++       << "  for (var r = 0u; r < 2u; r++) {\n"
++       << "    let m = tile_m + sum_m + r;\n"
++       << "    for (var c = 0u; c < 4u; c++) {\n"
++       << "      let n = tile_n + sum_n + c;\n"
++       << "      if (m < uniforms.M && n < uniforms.N) { output[m * uniforms.N + n] = output_element_t(acc[r * 4u + c]); }\n"
++       << "    }\n"
++       << "  }\n";
++  return Status::OK();
++}
++
++Status ApplyMoEFloatMatMul(const Tensor* a, const Tensor* b, const Tensor* scales, int64_t K_op, int64_t N_op,
++                           int64_t block_size_op, MoEWeightFormat format, onnxruntime::webgpu::ComputeContext& context, Tensor* y,
++                           uint32_t weight_index, const Tensor* weight_index_indirect, uint32_t override_M) {
++  MatMulComputeHelper helper;
++  ORT_RETURN_IF_ERROR(helper.Compute(a->Shape(), TensorShape({N_op, K_op}), false, true));
++  const uint32_t M = onnxruntime::narrow<uint32_t>(helper.M());
++  const uint32_t N = onnxruntime::narrow<uint32_t>(N_op);
++  const uint32_t K = onnxruntime::narrow<uint32_t>(K_op);
++  const uint32_t block_size = onnxruntime::narrow<uint32_t>(block_size_op);
++  const uint32_t rows = override_M > 0 ? override_M : M;
++  ORT_RETURN_IF_NOT(K % 32 == 0 && block_size % 8 == 0 && K % block_size == 0 && block_size >= 32 / Bits(format) * 1,
++                    "QMoE weight_format needs K a multiple of 32 and of block_size (a multiple of 8), got K=", K,
++                    ", block_size=", block_size);
++  ORT_RETURN_IF_NOT(format != MoEWeightFormat::E4M3 || block_size % 4 == 0, "e4m3 needs block_size a multiple of 4");
++
++  if (weight_index_indirect != nullptr || rows <= kMoEFloatDecodeMaxRows) {
++    const bool has_indirect = weight_index_indirect != nullptr;
++    MoEFloatDecodeProgram program{format, block_size, has_indirect};
++    program.AddInput({a, ProgramTensorMetadataDependency::TypeAndRank});
++    program.AddInput({b, ProgramTensorMetadataDependency::TypeAndRank, ProgramInput::Flatten, 4});
++    program.AddInput({scales, ProgramTensorMetadataDependency::TypeAndRank, ProgramInput::Flatten, 1});
++    if (has_indirect) program.AddInput({weight_index_indirect, ProgramTensorMetadataDependency::None});
++    program.AddOutput({y, ProgramTensorMetadataDependency::None});
++    program.SetWorkgroupSize(kDecodeTeams * 32);
++    program.SetDispatchGroupSize(CeilDiv(N, kDecodeTeams), rows, 1);
++    program.AddUniformVariables({{N}, {K}, {rows}, {M}, {weight_index}});
++    program.CacheHint(static_cast<int>(format), block_size, has_indirect);
++    return context.RunProgram(program);
++  }
++
++  const uint32_t n_tiles = CeilDiv(N, kTileN);
++  MoEFloatTileProgram program{format, block_size};
++  program.AddInput({a, ProgramTensorMetadataDependency::TypeAndRank});
++  program.AddInput({b, ProgramTensorMetadataDependency::TypeAndRank, ProgramInput::Flatten, 4});
++  program.AddInput({scales, ProgramTensorMetadataDependency::TypeAndRank, ProgramInput::Flatten, 1});
++  program.AddOutput({y, ProgramTensorMetadataDependency::None});
++  program.SetWorkgroupSize(256);
++  program.SetDispatchGroupSize(n_tiles * CeilDiv(M, kTileM));
++  program.AddUniformVariables({{M}, {N}, {K}, {n_tiles}, {weight_index}});
++  program.CacheHint(static_cast<int>(format), block_size);
++  return context.RunProgram(program);
++}
++
++}  // namespace webgpu
++}  // namespace contrib
++}  // namespace onnxruntime
+diff --git a/onnxruntime/contrib_ops/webgpu/moe/qmoe_float_weights.h b/onnxruntime/contrib_ops/webgpu/moe/qmoe_float_weights.h
+new file mode 100644
+index 0000000..26d7d10
+--- /dev/null
++++ b/onnxruntime/contrib_ops/webgpu/moe/qmoe_float_weights.h
+@@ -0,0 +1,77 @@
++// Copyright (c) Quick Inference contributors.
++// Licensed under the MIT License.
++// Quick Inference patch: QMoE experts whose weights are small floats rather than integers (QMoE's weight_format
++// attribute), as NVIDIA's NVFP4 and the OCP MX formats store them:
++//   "e2m1": 4-bit E2M1 codes (values 0, 0.5, 1, 1.5, 2, 3, 4, 6 and their negatives), two per byte, the even weight in
++//           the low nibble (MatMulNBits' 4-bit order);
++//   "e4m3": 8-bit float8 E4M3 values (FN: no infinities).
++// Each block of block_size weights along K has one scale (QMoE's scales input), so a weight is value * scale. The
++// layout is QMoE's: per expert, weights [N, K * bits / 8] and scales [N, K / block_size].
++
++#pragma once
++
++#include "core/providers/webgpu/program.h"
++#include "core/providers/webgpu/webgpu_kernel.h"
++
++namespace onnxruntime {
++namespace contrib {
++namespace webgpu {
++
++using namespace onnxruntime::webgpu;
++
++enum class MoEWeightFormat {
++  Int = 0,
++  E2M1 = 1,
++  E4M3 = 2,
++};
++
++// Rows of A up to which the decode program is used (more take the tiled one, one expert at a time).
++constexpr uint32_t kMoEFloatDecodeMaxRows = 8;
++
++// One workgroup per 8 output columns of one row: each team of 32 lanes sums one column, a lane taking every 32nd block
++// of K (adjacent lanes read adjacent blocks). Each row of the output reads its own expert (weight_index_indirect) and
++// row (row * rows_a / rows) of A.
++class MoEFloatDecodeProgram final : public Program<MoEFloatDecodeProgram> {
++ public:
++  MoEFloatDecodeProgram(MoEWeightFormat format, uint32_t block_size, bool has_indirect)
++      : Program{"MoEFloatDecode"}, format_{format}, block_size_{block_size}, has_indirect_{has_indirect} {}
++  Status GenerateShaderCode(ShaderHelper& sh) const override;
++  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES({"N", ProgramUniformVariableDataType::Uint32},
++                                          {"K", ProgramUniformVariableDataType::Uint32},
++                                          {"rows", ProgramUniformVariableDataType::Uint32},
++                                          {"rows_a", ProgramUniformVariableDataType::Uint32},
++                                          {"weight_index", ProgramUniformVariableDataType::Uint32});
++
++ private:
++  MoEWeightFormat format_;
++  uint32_t block_size_;
++  bool has_indirect_;
++};
++
++// Output tiles of 64 columns by 32 rows, K 32 weights at a time through workgroup memory; one expert (weight_index).
++class MoEFloatTileProgram final : public Program<MoEFloatTileProgram> {
++ public:
++  MoEFloatTileProgram(MoEWeightFormat format, uint32_t block_size)
++      : Program{"MoEFloatTile"}, format_{format}, block_size_{block_size} {}
++  Status GenerateShaderCode(ShaderHelper& sh) const override;
++  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES({"M", ProgramUniformVariableDataType::Uint32},
++                                          {"N", ProgramUniformVariableDataType::Uint32},
++                                          {"K", ProgramUniformVariableDataType::Uint32},
++                                          {"n_tiles", ProgramUniformVariableDataType::Uint32},
++                                          {"weight_index", ProgramUniformVariableDataType::Uint32});
++
++ private:
++  MoEWeightFormat format_;
++  uint32_t block_size_;
++};
++
++// y = a x W^T for one expert (weight_index) or, with weight_index_indirect, each row of y with its own expert;
++// override_M > rows of a broadcasts a's rows (as ApplyMatMulNBits does for QMoE's fused path).
++Status ApplyMoEFloatMatMul(const Tensor* a, const Tensor* b, const Tensor* scales, int64_t K, int64_t N,
++                           int64_t block_size, MoEWeightFormat format, onnxruntime::webgpu::ComputeContext& context, Tensor* y,
++                           uint32_t weight_index, const Tensor* weight_index_indirect = nullptr,
++                           uint32_t override_M = 0);
++
++}  // namespace webgpu
++}  // namespace contrib
++}  // namespace onnxruntime
+diff --git a/onnxruntime/contrib_ops/webgpu/moe/swiglu.wgsl.template b/onnxruntime/contrib_ops/webgpu/moe/swiglu.wgsl.template
+index 355f312..bf1fe76 100644
+--- a/onnxruntime/contrib_ops/webgpu/moe/swiglu.wgsl.template
++++ b/onnxruntime/contrib_ops/webgpu/moe/swiglu.wgsl.template
+@@ -18,6 +18,14 @@ $MAIN {
+   let col = global_idx % uniforms.cols;
+   let base = row * uniforms.cols;
+   let gate_up = vec2<f32>(input[base + col]);
++  // Quick Inference patch: softcapped SwiGLU (uniforms.gate_softcap > 0): c * tanh(x / c) bounds the gate's linear
++  // factor and up; the sigmoid sees the raw gate.
++  if (uniforms.gate_softcap > 0.0f) {
++    let g = uniforms.gate_softcap * tanh(gate_up.x / uniforms.gate_softcap);
++    let u = uniforms.up_softcap * tanh(gate_up.y / uniforms.up_softcap);
++    output[global_idx] = output_element_t(g / (1.0f + exp(-gate_up.x)) * u);
++    return;
++  }
+   let gate_val = min(gate_up.x, uniforms.swiglu_limit);
+   let up_val = clamp(gate_up.y, -uniforms.swiglu_limit, uniforms.swiglu_limit);
+   let glu = gate_val * 1.0f / (1.0f + exp(-uniforms.alpha * gate_val));
 diff --git a/onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_small_m.wgsl.template b/onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_small_m.wgsl.template
 index 027fc77..1e9857c 100644
 --- a/onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_small_m.wgsl.template
@@ -2410,10 +2846,28 @@ index d1d9c58..2bfe451 100644
      BuildKernelCreateInfo<class ONNX_OPERATOR_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kMSDomain, 1, MultiHeadAttention)>,
      BuildKernelCreateInfo<class ONNX_OPERATOR_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kMSDomain, 1, PagedAttention)>,
 diff --git a/onnxruntime/core/graph/contrib_ops/contrib_defs.cc b/onnxruntime/core/graph/contrib_ops/contrib_defs.cc
-index cc3f46b..6ced72b 100644
+index cc3f46b..fea6198 100644
 --- a/onnxruntime/core/graph/contrib_ops/contrib_defs.cc
 +++ b/onnxruntime/core/graph/contrib_ops/contrib_defs.cc
-@@ -3848,6 +3848,59 @@ For example, for 4 bits, the first 4 bits are stored in the lower 4 bits of a by
+@@ -1498,6 +1498,17 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
+               "The limit used to clamp inputs in SwiGLU. It is infinite when limit is not provided.",
+               AttributeProto::FLOAT,
+               OPTIONAL_VALUE)
++        // Quick Inference patch: experts stored as small floats, and softcapped SwiGLU (Inkling 2).
++        .Attr("weight_format",
++              "How expert weights are stored: int (default; integer codes and scales, with optional zero points), "
++              "e2m1 (4-bit E2M1 floats, as NVFP4/MXFP4 store them) or e4m3 (float8 E4M3), each block of block_size "
++              "weights times its scale. WebGPU only.",
++              AttributeProto::STRING, std::string("int"))
++        .Attr("swiglu_gate_softcap",
++              "With swiglu_up_softcap: SwiGLU as g * tanh(gate / g) * sigmoid(gate) * u * tanh(up / u). 0 is plain "
++              "SwiGLU. WebGPU only.",
++              AttributeProto::FLOAT, 0.0f)
++        .Attr("swiglu_up_softcap", "See swiglu_gate_softcap.", AttributeProto::FLOAT, 0.0f)
+         .Attr("activation_alpha",
+               "Alpha parameter used in activation function.",
+               AttributeProto::FLOAT, 1.0f)
+@@ -3848,6 +3859,59 @@ For example, for 4 bits, the first 4 bits are stored in the lower 4 bits of a by
          }
        });
  
